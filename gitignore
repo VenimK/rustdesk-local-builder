@@ -1,0 +1,21 @@
+# --- runtime scratch & outputs (never commit these) ---
+workspace/
+.toolchains/
+
+# --- python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# --- os junk ---
+.DS_Store
+Thumbs.db
+
+# --- PUBLIC REPO ONLY --------------------------------------------------
+# Your real configs/RustDesk.json holds your server + a permanent access
+# password. If this repo is PUBLIC, uncomment the next line so it stays
+# local, and let people copy configs/RustDesk.example.json instead.
+# (Leave it commented for a PRIVATE repo, so your settings travel with it.)
+configs/RustDesk.json

@@ -1,0 +1,296 @@
+"""
+prereqs.py — detect the build toolchains on this machine and, when something
+is missing, say exactly how to get it for the current OS.
+
+The versions mirror rustdesk-builder-v2's workflows:
+    Rust 1.75 · Flutter 3.24.5 · LLVM 15 · NDK r28c · vcpkg (pinned commit)
+
+We only *detect and advise* here — nothing is installed automatically, because
+these are large system-wide toolchains a person should install deliberately.
+"""
+
+import os
+import platform
+import shutil
+import subprocess
+
+
+PINNED = {
+    "rust": "1.75",
+    "flutter": "3.24.5",
+    "llvm": "15.0.6",
+    "ndk": "r28c",
+}
+
+
+def _system():
+    s = platform.system()
+    return {"Darwin": "macOS"}.get(s, s)
+
+
+def _which(name):
+    return shutil.which(name)
+
+
+def _run_version(cmd):
+    """Run a --version-style command, return first line of output or None."""
+    try:
+        out = subprocess.check_output(
+            cmd, stderr=subprocess.STDOUT, timeout=20,
+            encoding="utf-8", errors="replace",
+        )
+        return out.strip().splitlines()[0] if out.strip() else ""
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# individual checks — each returns a status dict
+# ---------------------------------------------------------------------------
+
+def _status(present, version="", path="", note="", hint=""):
+    return {"present": bool(present), "version": version or "",
+            "path": path or "", "note": note or "", "hint": hint or ""}
+
+
+def check_git():
+    p = _which("git")
+    return _status(p, _run_version(["git", "--version"]) or "", p or "",
+                   hint=_install_hint("git"))
+
+
+def check_python():
+    # we're literally running in python, so it's present; report the interpreter
+    p = shutil.which("python3") or shutil.which("python") or ""
+    return _status(True, "Python " + platform.python_version(), p)
+
+
+def check_rust():
+    rc = _which("rustc")
+    cg = _which("cargo")
+    if not (rc and cg):
+        return _status(False, hint=_install_hint("rust"))
+    ver = _run_version(["rustc", "--version"]) or ""
+    note = ""
+    if PINNED["rust"] not in ver:
+        note = f"Workflows pin {PINNED['rust']}; rustup can add it: rustup toolchain install {PINNED['rust']}"
+    return _status(True, ver, rc, note=note)
+
+
+def check_flutter():
+    p = _which("flutter")
+    if not p:
+        return _status(False, hint=_install_hint("flutter"))
+    ver = _run_version(["flutter", "--version"]) or ""
+    note = ""
+    if PINNED["flutter"] not in ver:
+        note = f"Workflows use Flutter {PINNED['flutter']}."
+    return _status(True, ver, p, note=note)
+
+
+def check_clang():
+    for name in ("clang", "cc", "gcc"):
+        p = _which(name)
+        if p:
+            return _status(True, _run_version([name, "--version"]) or name, p)
+    return _status(False, hint=_install_hint("clang"))
+
+
+def check_llvm():
+    # RustDesk's bindgen only needs libclang. Accept either a clang/llvm-config
+    # on PATH, or a LIBCLANG_PATH that actually contains a libclang library.
+    lp = os.environ.get("LIBCLANG_PATH")
+    if lp and os.path.isdir(lp):
+        for f in os.listdir(lp):
+            if f.startswith("libclang") and any(e in f for e in (".dll", ".so", ".dylib")):
+                return _status(True, "libclang (" + f + ")", lp)
+    p = _which("llvm-config") or _which("clang")
+    if not p:
+        return _status(False, hint=_install_hint("llvm"))
+    ver = _run_version([os.path.basename(p), "--version"]) or ""
+    return _status(True, ver, p)
+
+
+def check_vcpkg():
+    root = os.environ.get("VCPKG_ROOT")
+    exe = None
+    if root:
+        cand = os.path.join(root, "vcpkg.exe" if _system() == "Windows" else "vcpkg")
+        if os.path.exists(cand):
+            exe = cand
+    exe = exe or _which("vcpkg")
+    if not exe:
+        return _status(False, hint=_install_hint("vcpkg"))
+    return _status(True, _run_version([exe, "version"]) or "vcpkg", exe,
+                   note="RustDesk pins a vcpkg commit; the builder checks it out for you.")
+
+
+def check_msbuild():
+    if _system() != "Windows":
+        return _status(False, note="Windows only.")
+    p = _which("msbuild") or _which("MSBuild")
+    if p:
+        return _status(True, _run_version([p, "-version"]) or "MSBuild", p)
+    # Use vswhere (ships with any VS/Build Tools install) to find MSBuild + the
+    # MSVC toolset. This is what tells us link.exe is available for Rust.
+    pf = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+    vswhere = os.path.join(pf, "Microsoft Visual Studio", "Installer", "vswhere.exe")
+    if os.path.exists(vswhere):
+        try:
+            out = subprocess.check_output(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                encoding="utf-8", errors="replace", timeout=20).strip()
+            if out:
+                # find MSBuild.exe under the install for a version string
+                msb = ""
+                for root, _dirs, files in os.walk(os.path.join(out, "MSBuild")):
+                    if "MSBuild.exe" in files:
+                        msb = os.path.join(root, "MSBuild.exe"); break
+                return _status(True, "VC++ Build Tools + MSBuild", msb or out,
+                               note="MSVC linker (link.exe) available for Rust.")
+        except Exception:
+            pass
+    # fall back to a directory heuristic
+    guess = os.path.join(pf, "Microsoft Visual Studio")
+    present = os.path.isdir(guess)
+    return _status(present, "Visual Studio detected" if present else "",
+                   guess if present else "", hint=_install_hint("msbuild"))
+
+
+def check_java():
+    p = _which("java")
+    if not p:
+        return _status(False, hint=_install_hint("java"))
+    return _status(True, _run_version(["java", "-version"]) or "java", p)
+
+
+def check_android_ndk():
+    # NDK is found via env or inside the Android SDK
+    for var in ("ANDROID_NDK_HOME", "ANDROID_NDK_ROOT", "NDK_HOME"):
+        v = os.environ.get(var)
+        if v and os.path.isdir(v):
+            return _status(True, os.path.basename(v.rstrip("/\\")), v)
+    sdk = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+    if sdk:
+        ndk_dir = os.path.join(sdk, "ndk")
+        if os.path.isdir(ndk_dir):
+            versions = sorted(os.listdir(ndk_dir))
+            if versions:
+                return _status(True, versions[-1], os.path.join(ndk_dir, versions[-1]))
+    return _status(False, hint=_install_hint("android_ndk"))
+
+
+def check_xcode():
+    if _system() != "macOS":
+        return _status(False, note="macOS only.")
+    p = _which("xcodebuild")
+    if p:
+        return _status(True, _run_version(["xcodebuild", "-version"]) or "Xcode", p)
+    return _status(False, hint=_install_hint("xcode"))
+
+
+CHECKS = {
+    "git": check_git,
+    "python": check_python,
+    "rust": check_rust,
+    "flutter": check_flutter,
+    "clang": check_clang,
+    "llvm": check_llvm,
+    "vcpkg": check_vcpkg,
+    "msbuild": check_msbuild,
+    "java": check_java,
+    "android_ndk": check_android_ndk,
+    "xcode": check_xcode,
+}
+
+LABELS = {
+    "git": "Git",
+    "python": "Python 3",
+    "rust": "Rust toolchain (rustc + cargo)",
+    "flutter": "Flutter SDK",
+    "clang": "C/C++ compiler (clang/gcc)",
+    "llvm": "LLVM / libclang",
+    "vcpkg": "vcpkg (native deps: ffmpeg, hwcodec)",
+    "msbuild": "MSBuild (Visual Studio)",
+    "java": "Java (JDK 17)",
+    "android_ndk": "Android NDK",
+    "xcode": "Xcode command-line tools",
+}
+
+
+def check_all():
+    return {k: fn() for k, fn in CHECKS.items()}
+
+
+def summary():
+    all_status = check_all()
+    out = []
+    for k, st in all_status.items():
+        out.append({"id": k, "label": LABELS.get(k, k), **st})
+    return out
+
+
+# ---------------------------------------------------------------------------
+# per-OS install hints
+# ---------------------------------------------------------------------------
+
+def _install_hint(tool):
+    os_name = _system()
+    hints = {
+        "git": {
+            "Windows": "Install Git for Windows: https://git-scm.com/download/win",
+            "Linux": "sudo apt install git   (or your distro's package manager)",
+            "macOS": "xcode-select --install   (bundles git), or: brew install git",
+        },
+        "rust": {
+            "Windows": "Install rustup: https://rustup.rs  then: rustup toolchain install 1.75",
+            "Linux": "curl https://sh.rustup.rs -sSf | sh   then: rustup toolchain install 1.75",
+            "macOS": "curl https://sh.rustup.rs -sSf | sh   then: rustup toolchain install 1.75",
+        },
+        "flutter": {
+            "Windows": "Install Flutter 3.24.5: https://docs.flutter.dev/get-started/install/windows",
+            "Linux": "Install Flutter 3.24.5: https://docs.flutter.dev/get-started/install/linux",
+            "macOS": "Install Flutter 3.24.5: https://docs.flutter.dev/get-started/install/macos  (or: brew install --cask flutter)",
+        },
+        "clang": {
+            "Windows": "Comes with Visual Studio C++ workload.",
+            "Linux": "sudo apt install clang cmake ninja-build pkg-config libgtk-3-dev",
+            "macOS": "xcode-select --install",
+        },
+        "llvm": {
+            "Windows": "Install LLVM 15: https://github.com/llvm/llvm-project/releases  and set LIBCLANG_PATH.",
+            "Linux": "sudo apt install llvm-dev libclang-dev clang",
+            "macOS": "brew install llvm@15",
+        },
+        "vcpkg": {
+            "Windows": "git clone https://github.com/microsoft/vcpkg  then set VCPKG_ROOT. The builder checks out the pinned commit.",
+            "Linux": "git clone https://github.com/microsoft/vcpkg  then set VCPKG_ROOT.",
+            "macOS": "git clone https://github.com/microsoft/vcpkg  then set VCPKG_ROOT.",
+        },
+        "msbuild": {
+            "Windows": "Click install to get Build Tools for Visual Studio (C++) — the command-line MSVC toolset (link.exe) + MSBuild, no full IDE.",
+            "Linux": "N/A — MSI is Windows-only.",
+            "macOS": "N/A — MSI is Windows-only.",
+        },
+        "java": {
+            "Windows": "Install JDK 17: https://adoptium.net",
+            "Linux": "sudo apt install openjdk-17-jdk",
+            "macOS": "brew install openjdk@17",
+        },
+        "android_ndk": {
+            "Windows": "Install Android Studio, add NDK r28c via SDK Manager, set ANDROID_NDK_HOME.",
+            "Linux": "Install Android command-line tools + NDK r28c, set ANDROID_NDK_HOME.",
+            "macOS": "Install Android Studio / cmdline-tools + NDK r28c, set ANDROID_NDK_HOME.",
+        },
+        "xcode": {
+            "macOS": "xcode-select --install   then: brew install create-dmg",
+        },
+    }
+    return hints.get(tool, {}).get(os_name, "")
+
+
+if __name__ == "__main__":
+    import json
+    print(json.dumps(summary(), indent=2))
