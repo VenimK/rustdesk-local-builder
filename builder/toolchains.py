@@ -23,7 +23,6 @@ import platform
 import shutil
 import ssl
 import subprocess
-import sys
 import tarfile
 import tempfile
 import time
@@ -38,7 +37,7 @@ PINNED = {"flutter": "3.24.5", "llvm": "15.0.6", "ndk": "r28c",
 # costs before installing and what deleting it will free.
 SIZE_HINTS = {
     "flutter":     {"download": "~1.1 GB", "disk": "~2.8 GB", "version": "3.24.5"},
-    "llvm":        {"download": "~30 MB", "disk": "~90 MB", "version": "15/16"},
+    "llvm":        {"download": "~150 MB", "disk": "~2.5 GB", "version": "15.0.6"},
     "android_ndk": {"download": "~700 MB", "disk": "~2.6 GB", "version": "r28c"},
     "java":        {"download": "~190 MB", "disk": "~330 MB", "version": "17 (Temurin)"},
     "vcpkg":       {"download": "~10 MB",  "disk": "~600 MB", "version": "pinned"},
@@ -59,7 +58,7 @@ def _arch():
     if m in ("x86_64", "amd64", "x64"):
         return "x86_64"
     if m in ("arm64", "aarch64"):
-        return "aarch64"
+        return "arm64"
     return m
 
 
@@ -79,21 +78,19 @@ TOOLS = {
             ("Windows", "x86_64"): (f"{FLUTTER_BASE}/windows/flutter_windows_3.24.5-stable.zip", "zip"),
             ("Linux", "x86_64"):   (f"{FLUTTER_BASE}/linux/flutter_linux_3.24.5-stable.tar.xz", "tar"),
             ("macOS", "x86_64"):   (f"{FLUTTER_BASE}/macos/flutter_macos_3.24.5-stable.zip", "zip"),
-            ("macOS", "aarch64"):    (f"{FLUTTER_BASE}/macos/flutter_macos_arm64_3.24.5-stable.zip", "zip"),
+            ("macOS", "arm64"):    (f"{FLUTTER_BASE}/macos/flutter_macos_arm64_3.24.5-stable.zip", "zip"),
         },
         "marker": os.path.join("bin", "flutter.bat" if WIN else "flutter"),
     },
     "llvm": {
-        "label": "LLVM / libclang 15",
+        "label": "LLVM / clang 15.0.6",
         "kind": "archive",
         "urls": {
-            # Windows: the official LLVM installer needs admin and is flaky, so we
-            # fetch just libclang (all bindgen needs) via pip — no admin, reliable.
-            ("Windows", "x86_64"): ("libclang==16.0.6", "pip"),
+            ("Windows", "x86_64"): (f"{LLVM_REL}/LLVM-15.0.6-win64.exe", "nsis"),
             ("Linux", "x86_64"):   (f"{LLVM_REL}/clang+llvm-15.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz", "tar"),
-            ("Linux", "aarch64"):    (f"{LLVM_REL}/clang+llvm-15.0.6-aarch64-linux-gnu.tar.xz", "tar"),
-            ("macOS", "x86_64"):   (f"{LLVM_REL}/clang+llvm-15.0.6-x86_64-apple-darwin.tar.xz", "tar"),
-            ("macOS", "aarch64"):    (f"{LLVM_REL}/clang+llvm-15.0.6-arm64-apple-darwin22.0.tar.xz", "tar"),
+            ("Linux", "arm64"):    (f"{LLVM_REL}/clang+llvm-15.0.6-aarch64-linux-gnu.tar.xz", "tar"),
+            ("macOS", "x86_64"):   (f"{LLVM_REL}/clang+llvm-15.0.6-x86_64-apple-darwin21.0.tar.xz", "tar"),
+            ("macOS", "arm64"):    (f"{LLVM_REL}/clang+llvm-15.0.6-arm64-apple-darwin21.0.tar.xz", "tar"),
         },
         "marker": os.path.join("bin", "clang" + EXE),
     },
@@ -104,7 +101,7 @@ TOOLS = {
             ("Windows", "x86_64"): (f"{NDK_BASE}/android-ndk-r28c-windows.zip", "zip"),
             ("Linux", "x86_64"):   (f"{NDK_BASE}/android-ndk-r28c-linux.zip", "zip"),
             ("macOS", "x86_64"):   (f"{NDK_BASE}/android-ndk-r28c-darwin.dmg", "dmg"),
-            ("macOS", "aarch64"):    (f"{NDK_BASE}/android-ndk-r28c-darwin.dmg", "dmg"),
+            ("macOS", "arm64"):    (f"{NDK_BASE}/android-ndk-r28c-darwin.dmg", "dmg"),
         },
         "marker": "source.properties",
     },
@@ -114,9 +111,9 @@ TOOLS = {
         "urls": {
             ("Windows", "x86_64"): (f"{ADOPTIUM}/windows/x64/jdk/hotspot/normal/eclipse", "zip"),
             ("Linux", "x86_64"):   (f"{ADOPTIUM}/linux/x64/jdk/hotspot/normal/eclipse", "tar"),
-            ("Linux", "aarch64"):    (f"{ADOPTIUM}/linux/aarch64/jdk/hotspot/normal/eclipse", "tar"),
+            ("Linux", "arm64"):    (f"{ADOPTIUM}/linux/aarch64/jdk/hotspot/normal/eclipse", "tar"),
             ("macOS", "x86_64"):   (f"{ADOPTIUM}/mac/x64/jdk/hotspot/normal/eclipse", "tar"),
-            ("macOS", "aarch64"):    (f"{ADOPTIUM}/mac/aarch64/jdk/hotspot/normal/eclipse", "tar"),
+            ("macOS", "arm64"):    (f"{ADOPTIUM}/mac/aarch64/jdk/hotspot/normal/eclipse", "tar"),
         },
         "marker": os.path.join("bin", "java" + EXE),
     },
@@ -132,9 +129,9 @@ TOOLS = {
         "urls": {
             ("Windows", "x86_64"): ("https://win.rustup.rs/x86_64", "rustup-init.exe"),
             ("Linux", "x86_64"):   ("https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init", "rustup-init"),
-            ("Linux", "aarch64"):    ("https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init", "rustup-init"),
+            ("Linux", "arm64"):    ("https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init", "rustup-init"),
             ("macOS", "x86_64"):   ("https://static.rust-lang.org/rustup/dist/x86_64-apple-darwin/rustup-init", "rustup-init"),
-            ("macOS", "aarch64"):    ("https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init", "rustup-init"),
+            ("macOS", "arm64"):    ("https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init", "rustup-init"),
         },
     },
     # Build Tools for Visual Studio — the command-line-only subset of VS (no IDE).
@@ -325,16 +322,15 @@ def _locate(base, marker, log):
     return base
 
 
-def _llvm_env(home):
-    """LIBCLANG_PATH = the dir that actually contains libclang.(dll|so|dylib).
-    Handles both the pip layout (clang/native/) and the tarball layout (lib/)."""
-    for dp, _dirs, files in os.walk(home):
-        for f in files:
-            if f.startswith("libclang") and any(e in f for e in (".dll", ".so", ".dylib")):
-                return {"vars": {"LIBCLANG_PATH": dp}, "path": [dp]}
-    # fall back to the conventional tarball location
-    lib = os.path.join(home, "lib")
-    return {"vars": {"LIBCLANG_PATH": lib}, "path": [os.path.join(home, "bin")]}
+def _libclang_dir(home):
+    """Return the directory that contains libclang.{dylib,so,dll}."""
+    names = ("libclang.dylib", "libclang.so", "libclang.dll")
+    for sub in ("lib", "bin"):
+        d = os.path.join(home, sub)
+        if any(os.path.isfile(os.path.join(d, n)) for n in names):
+            return d
+    # Fall back to lib on Unix, bin on Windows.
+    return os.path.join(home, "lib") if not WIN else os.path.join(home, "bin")
 
 
 def _env_for(tid, home):
@@ -343,7 +339,14 @@ def _env_for(tid, home):
     if tid == "flutter":
         return {"vars": {}, "path": [bindir]}
     if tid == "llvm":
-        return _llvm_env(home)
+        # LIBCLANG_PATH alone is what bindgen/ffigen need. Putting the
+        # tarball's bin/ on PATH on macOS shadows Apple clang and breaks
+        # compiles (missing SDK headers). Keep bin/ on PATH only for Windows,
+        # where the system rarely has a usable clang/llvm-config.
+        env = {"vars": {"LIBCLANG_PATH": _libclang_dir(home)}, "path": []}
+        if WIN:
+            env["path"] = [bindir]
+        return env
     if tid == "java":
         # macOS Temurin nests Contents/Home
         mac_home = os.path.join(home, "Contents", "Home")
@@ -428,7 +431,7 @@ def install_one(tid, root, log, cancelled=lambda: False):
             log("  already present, updating")
         else:
             log(f"  git clone {spec['repo']}")
-            rc = subprocess.call(["git", "clone", "--depth", "1", spec["repo"], home_target])
+            rc = subprocess.call(["git", "clone", spec["repo"], home_target])
             if rc != 0:
                 raise RuntimeError("git clone failed")
         # bootstrap so the vcpkg binary exists
@@ -442,25 +445,6 @@ def install_one(tid, root, log, cancelled=lambda: False):
     url, arch_kind = spec["urls"][(host_os, host_arch)]
     if cancelled():
         raise RuntimeError("cancelled")
-
-    if arch_kind == "pip":
-        # Fetch just libclang (bindgen only needs libclang.dll) via pip into a
-        # local dir. No admin, no NSIS. `url` holds the pip requirement string.
-        if os.path.isdir(home_target):
-            shutil.rmtree(home_target, ignore_errors=True)
-        os.makedirs(home_target, exist_ok=True)
-        log(f"  pip install {url} → {home_target}")
-        rc = subprocess.call([sys.executable, "-m", "pip", "install",
-                              "--no-input", "--target", home_target, url])
-        if rc != 0:
-            raise RuntimeError("pip install libclang failed")
-        env = _llvm_env(home_target)
-        libdir = env["vars"].get("LIBCLANG_PATH", "")
-        if libdir and any(f.startswith("libclang") for f in os.listdir(libdir)):
-            log(f"  ✓ libclang at {libdir}")
-        else:
-            log("  ! libclang not found after pip install")
-        return {"tool": tid, "home": home_target, "env": env}
 
     if arch_kind == "nsis":
         # The official LLVM Windows installer is requireAdministrator, so a plain
@@ -572,9 +556,36 @@ def _load_env(root):
 
 
 def apply_persisted_env(root):
-    """Call at startup: set vars + prepend PATH so detection sees local tools."""
+    """Call at startup: set vars + prepend PATH so detection sees local tools.
+
+    Self-heals a common stale LIBCLANG_PATH that points at LLVM's bin/ instead
+    of lib/ (bindgen needs the directory that contains libclang.dylib/so/dll).
+    """
     d = _load_env(root)
-    for k, v in d.get("vars", {}).items():
+    vars_ = d.get("vars", {})
+    libclang = vars_.get("LIBCLANG_PATH")
+    if libclang:
+        names = ("libclang.dylib", "libclang.so", "libclang.dll",
+                 "libclang.so.15", "libclang.so.16", "libclang.so.17")
+        def _has(dpath):
+            return any(os.path.isfile(os.path.join(dpath, n)) for n in names)
+        if not _has(libclang):
+            # try sibling lib/ (or bin/ on Windows) next to a mistaken path
+            parent = os.path.dirname(libclang.rstrip(os.sep))
+            for cand in (os.path.join(parent, "lib"),
+                         os.path.join(parent, "bin"),
+                         parent):
+                if _has(cand):
+                    vars_["LIBCLANG_PATH"] = cand
+                    d["vars"] = vars_
+                    try:
+                        with open(env_path(root), "w") as f:
+                            json.dump(d, f, indent=2)
+                            f.write("\n")
+                    except Exception:
+                        pass
+                    break
+    for k, v in vars_.items():
         os.environ[k] = v
     if d.get("path"):
         sep = os.pathsep

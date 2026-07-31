@@ -17,6 +17,7 @@ platform, the CUSTOM_* env dict, and a `log` callback for streaming progress.
 import os
 import re
 import subprocess
+import sys
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ def _apply_allow_custom(src, patches_dir, log):
     common = os.path.join(src, "src", "common.rs")
     if os.path.exists(script) and os.path.exists(common):
         try:
-            subprocess.run(["python3", script], cwd=src, check=True,
+            subprocess.run([sys.executable, script], cwd=src, check=True,
                            capture_output=True, text=True)
             log("    · allowCustom.py applied")
         except subprocess.CalledProcessError as e:
@@ -239,9 +240,13 @@ def _apply_android_embed(src, env, log):
     if not (ok1 and ok2):
         log("    ! WARNING: one of the Android embed points was not found — "
             "password may not preset (see SKILL.md §4.2)")
-    # app id
+    # app id — Android requires at least one dot in the package name.
+    # Auto-prefix with "com." if the user-supplied id has no dot.
     app_id = env.get("CUSTOM_ANDROID_APP_ID", "")
     if app_id:
+        if "." not in app_id:
+            app_id = f"com.{app_id}"
+            log(f"    · android app id auto-prefixed → {app_id}")
         sed(src, "flutter/android/app/build.gradle", "com.carriez.flutter_hbb", app_id, log)
     # remove android scam warning
     sed_regex(src, "flutter/lib/mobile/pages/server_page.dart",

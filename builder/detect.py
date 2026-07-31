@@ -270,7 +270,12 @@ def required_tools(target, host_os_name):
             tools += ["msbuild"]
         return tools
     if p == "linux":
-        return common + ["flutter", "clang", "vcpkg"]
+        tools = common + ["flutter", "clang", "vcpkg"]
+        if target["ext"] == "rpm":
+            tools += ["rpmbuild"]
+        if target["ext"] == "AppImage":
+            tools += ["appimage_builder"]
+        return tools
     if p == "macos":
         return common + ["flutter", "xcode"]
     if p == "android":

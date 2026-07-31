@@ -77,6 +77,43 @@ def check_rust():
     return _status(True, ver, rc, note=note)
 
 
+def check_rust_target():
+    """On Windows, verify the default Rust target is x86_64-pc-windows-msvc.
+    The builder always enforces MSVC (matching the official CI); the GNU
+    target requires gcc.exe (MinGW) which most setups don't have."""
+    if _system() != "Windows":
+        return _status(True, note="N/A on non-Windows hosts.")
+    try:
+        out = subprocess.check_output(
+            ["rustup", "show"], stderr=subprocess.STDOUT, timeout=20,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return _status(False, hint="Install rustup: https://rustup.rs")
+    show = out or ""
+    has_msvc = "windows-msvc" in show
+    has_pinned = PINNED["rust"] in show
+    if has_msvc and has_pinned:
+        return _status(True, f"{PINNED['rust']} x86_64-pc-windows-msvc", "",
+                       note="Pinned Rust + MSVC target — matches official CI.")
+    if has_msvc and not has_pinned:
+        return _status(
+            True, "x86_64-pc-windows-msvc", "",
+            note=f"MSVC target present but Rust {PINNED['rust']} not installed.",
+            hint=f"The builder will install it automatically, or run:\n"
+                 f"  rustup toolchain install {PINNED['rust']}-x86_64-pc-windows-msvc\n"
+                 f"  rustup default {PINNED['rust']}-x86_64-pc-windows-msvc",
+        )
+    return _status(
+        False, "", "",
+        note="Default Rust target is not windows-msvc.",
+        hint="Switch to MSVC (the builder will do this automatically):\n"
+             f"  rustup toolchain install {PINNED['rust']}-x86_64-pc-windows-msvc\n"
+             f"  rustup default {PINNED['rust']}-x86_64-pc-windows-msvc\n"
+             "  (requires Visual Studio Build Tools with C++ workload)",
+    )
+
+
 def check_flutter():
     p = _which("flutter")
     if not p:
@@ -97,18 +134,21 @@ def check_clang():
 
 
 def check_llvm():
-    # RustDesk's bindgen only needs libclang. Accept either a clang/llvm-config
-    # on PATH, or a LIBCLANG_PATH that actually contains a libclang library.
-    lp = os.environ.get("LIBCLANG_PATH")
-    if lp and os.path.isdir(lp):
-        for f in os.listdir(lp):
-            if f.startswith("libclang") and any(e in f for e in (".dll", ".so", ".dylib")):
-                return _status(True, "libclang (" + f + ")", lp)
+    # RustDesk's bindgen wants libclang; look for llvm-config or clang
     p = _which("llvm-config") or _which("clang")
     if not p:
         return _status(False, hint=_install_hint("llvm"))
     ver = _run_version([os.path.basename(p), "--version"]) or ""
-    return _status(True, ver, p)
+    note = ""
+    if PINNED["llvm"] not in ver:
+        note = (f"Workflows pin LLVM {PINNED['llvm']}; newer versions can "
+                f"cause bindgen/libclang issues. Use the auto-installer "
+                f"or install LLVM {PINNED['llvm']} and set LIBCLANG_PATH.")
+    return _status(True, ver, p, note=note)
+
+
+# Must match the baseline in vcpkg.json and the official CI's VCPKG_COMMIT_ID.
+VCPKG_COMMIT = "120deac3062162151622ca4860575a33844ba10b"
 
 
 def check_vcpkg():
@@ -121,8 +161,23 @@ def check_vcpkg():
     exe = exe or _which("vcpkg")
     if not exe:
         return _status(False, hint=_install_hint("vcpkg"))
+
+    # vcpkg itself is a git repo; the build requires a specific commit.
+    vcpkg_root = root or (os.path.dirname(exe) if exe else None)
+    note = ""
+    if vcpkg_root and os.path.isdir(os.path.join(vcpkg_root, ".git")):
+        try:
+            cur = subprocess.check_output(
+                ["git", "-C", vcpkg_root, "rev-parse", "HEAD"],
+                text=True, stderr=subprocess.PIPE, timeout=10
+            ).strip()
+            if cur != VCPKG_COMMIT:
+                note = (f"vcpkg is on {cur[:8]}, but {VCPKG_COMMIT[:8]} is "
+                        f"required. The build will switch the checkout.")
+        except Exception:
+            pass
     return _status(True, _run_version([exe, "version"]) or "vcpkg", exe,
-                   note="RustDesk pins a vcpkg commit; the builder checks it out for you.")
+                   note=note or "vcpkg will be checked out to the pinned commit at build time.")
 
 
 def check_msbuild():
@@ -191,10 +246,25 @@ def check_xcode():
     return _status(False, hint=_install_hint("xcode"))
 
 
+def check_rpmbuild():
+    p = _which("rpmbuild")
+    if p:
+        return _status(True, _run_version(["rpmbuild", "--version"]) or "rpmbuild", p)
+    return _status(False, hint=_install_hint("rpmbuild"))
+
+
+def check_appimage_builder():
+    p = _which("appimage-builder")
+    if p:
+        return _status(True, "appimage-builder", p)
+    return _status(False, hint=_install_hint("appimage_builder"))
+
+
 CHECKS = {
     "git": check_git,
     "python": check_python,
     "rust": check_rust,
+    "rust_target": check_rust_target,
     "flutter": check_flutter,
     "clang": check_clang,
     "llvm": check_llvm,
@@ -203,12 +273,15 @@ CHECKS = {
     "java": check_java,
     "android_ndk": check_android_ndk,
     "xcode": check_xcode,
+    "rpmbuild": check_rpmbuild,
+    "appimage_builder": check_appimage_builder,
 }
 
 LABELS = {
     "git": "Git",
     "python": "Python 3",
     "rust": "Rust toolchain (rustc + cargo)",
+    "rust_target": "Rust target (MSVC vs GNU)",
     "flutter": "Flutter SDK",
     "clang": "C/C++ compiler (clang/gcc)",
     "llvm": "LLVM / libclang",
@@ -217,6 +290,8 @@ LABELS = {
     "java": "Java (JDK 17)",
     "android_ndk": "Android NDK",
     "xcode": "Xcode command-line tools",
+    "rpmbuild": "rpmbuild (RPM packaging)",
+    "appimage_builder": "appimage-builder (AppImage packaging)",
 }
 
 
@@ -286,6 +361,12 @@ def _install_hint(tool):
         },
         "xcode": {
             "macOS": "xcode-select --install   then: brew install create-dmg",
+        },
+        "rpmbuild": {
+            "Linux": "sudo apt install rpm  (or: sudo dnf install rpm-build)",
+        },
+        "appimage_builder": {
+            "Linux": "sudo apt install libarchive-tools libfuse2 && sudo pip3 install setuptools_scm<10 && sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git",
         },
     }
     return hints.get(tool, {}).get(os_name, "")
