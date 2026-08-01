@@ -301,64 +301,18 @@ document.addEventListener("input", e => {
 
 /* ── build console ────────────────────────────────────── */
 const con = $("#console");
-const MAX_DOM_LINES = 1500;      // cap DOM nodes so the tab stays responsive
-const MAX_BUFFER_LINES = 40000;  // full log kept for the copy button
-let logBuffer = [];              // complete (capped) log text for copying
-let pending = [];                // lines waiting to be flushed to the DOM
-let flushScheduled = false;
-
-function lineClass(text) {
-  if (text.startsWith("$ ")) return "con-cmd";
-  if (text.startsWith("=== ") || text.startsWith("\n=== ")) return "con-head";
-  if (/✓|artifact:|DONE/.test(text)) return "con-ok";
-  if (/^\s*!!|FAILED|error/i.test(text)) return "con-err";
-  if (/^\s*!|WARNING|warn/i.test(text)) return "con-warn";
-  return "";
-}
-
-function flushConsole() {
-  flushScheduled = false;
-  if (!pending.length) return;
-  const frag = document.createDocumentFragment();
-  for (const text of pending) {
-    const span = document.createElement("span");
-    const cls = lineClass(text);
-    if (cls) span.className = cls;
-    span.textContent = text + "\n";
-    frag.appendChild(span);
-  }
-  pending = [];
-  const nearBottom = con.scrollHeight - con.scrollTop - con.clientHeight < 120;
-  con.appendChild(frag);
-  // trim old DOM nodes to keep the tab snappy
-  while (con.childNodes.length > MAX_DOM_LINES) con.removeChild(con.firstChild);
-  if (nearBottom) con.scrollTop = con.scrollHeight;  // stick to bottom unless scrolled up
-}
-
 function conLine(text) {
-  logBuffer.push(text);
-  if (logBuffer.length > MAX_BUFFER_LINES) logBuffer.shift();
-  pending.push(text);
-  if (!flushScheduled) { flushScheduled = true; requestAnimationFrame(flushConsole); }
-}
-
-function clearConsole() {
-  con.innerHTML = ""; logBuffer = []; pending = [];
-}
-
-async function copyBuildLog(btn) {
-  const text = logBuffer.join("\n");
-  try {
-    await navigator.clipboard.writeText(text);
-    if (btn) { const o = btn.textContent; btn.textContent = "copied ✓"; setTimeout(() => btn.textContent = o, 1400); }
-  } catch {
-    // clipboard API can be blocked; fall back to a temporary textarea
-    const ta = document.createElement("textarea");
-    ta.value = text; document.body.appendChild(ta); ta.select();
-    try { document.execCommand("copy"); } catch {}
-    ta.remove();
-    if (btn) { const o = btn.textContent; btn.textContent = "copied ✓"; setTimeout(() => btn.textContent = o, 1400); }
-  }
+  const span = document.createElement("span");
+  let cls = "";
+  if (text.startsWith("$ ")) cls = "con-cmd";
+  else if (text.startsWith("=== ") || text.startsWith("\n=== ")) cls = "con-head";
+  else if (/✓|artifact:|DONE/.test(text)) cls = "con-ok";
+  else if (/^\s*!!|FAILED|error/i.test(text)) cls = "con-err";
+  else if (/^\s*!|WARNING|warn/i.test(text)) cls = "con-warn";
+  if (cls) span.className = cls;
+  span.textContent = text + "\n";
+  con.appendChild(span);
+  con.scrollTop = con.scrollHeight;
 }
 
 let timerHandle = null, startedAt = 0;
@@ -402,7 +356,6 @@ function renderArtifacts(list) {
     `<div class="artifact">${esc(a)}</div>`).join("");
 }
 
-$("#btn-copy-log").addEventListener("click", (e) => copyBuildLog(e.target));
 $("#btn-build").addEventListener("click", () => startBuild(false));
 $("#btn-plan").addEventListener("click", () => startBuild(true));
 $("#btn-cancel").addEventListener("click", () =>
@@ -416,7 +369,7 @@ async function startBuild(dry) {
   $('.tab[data-tab="console"]').classList.add("is-active");
   $("#tab-console").classList.add("is-active");
 
-  clearConsole();
+  con.innerHTML = "";
   renderArtifacts([]);
   const payload = {
     version: $("#version").value.trim() || "latest",
