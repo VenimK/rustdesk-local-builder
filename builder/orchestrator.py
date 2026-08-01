@@ -72,6 +72,8 @@ class Build:
             os.path.join(os.path.dirname(__file__), "..", "patches"))
         self.host = detect.host_info()
         self.artifacts = []
+        self._llvm_home = None
+        self._ffigen_cpath = ""
 
     # -- logging / cancel ---------------------------------------------------
     def log(self, msg=""):
@@ -177,12 +179,29 @@ class Build:
         self.run(["git", "clone", "--depth", "1", "--branch", self.version,
                   "--recurse-submodules", RUSTDESK_REPO, self.src_dir])
 
+    def _project_root(self):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
     def _has_libclang(self, d):
         """Check whether directory d contains a libclang shared library."""
         if not os.path.isdir(d):
             return False
-        return any(os.path.isfile(os.path.join(d, n))
-                   for n in ("libclang.dylib", "libclang.so", "libclang.dll"))
+        names = (
+            "libclang.dylib", "libclang.so", "libclang.dll",
+            "libclang.so.15", "libclang.so.16", "libclang.so.17",
+            "libclang.so.13", "libclang.so.14",
+        )
+        if any(os.path.isfile(os.path.join(d, n)) for n in names):
+            return True
+        # versioned sonames e.g. libclang.so.15.0.6
+        try:
+            return any(
+                n.startswith("libclang.so.") or n.startswith("libclang.")
+                for n in os.listdir(d)
+                if os.path.isfile(os.path.join(d, n))
+            )
+        except OSError:
+            return False
 
     def _find_llvm_home(self, tc_llvm):
         """Find the actual LLVM home under .toolchains/llvm (one-level nesting)."""
@@ -194,17 +213,110 @@ class Build:
                 return candidate
         return None
 
+    def _toolchains_llvm_home(self):
+        """Absolute path to the portable LLVM under .toolchains/, or None."""
+        return self._find_llvm_home(
+            os.path.join(self._project_root(), ".toolchains", "llvm"))
+
     def _libclang_dir(self, llvm_home):
         """Return the directory with libclang.dylib/so/dll."""
-        names = ("libclang.dylib", "libclang.so", "libclang.dll")
+        names = ("libclang.dylib", "libclang.so", "libclang.dll",
+                 "libclang.so.15", "libclang.so.16", "libclang.so.17")
         for sub in ("lib", "bin"):
             d = os.path.join(llvm_home, sub)
             if any(os.path.isfile(os.path.join(d, n)) for n in names):
                 return d
+            # any versioned libclang.so.*
+            try:
+                if any(n.startswith("libclang.so.") or n == "libclang.so"
+                       for n in os.listdir(d)
+                       if os.path.isfile(os.path.join(d, n))):
+                    return d
+            except OSError:
+                pass
         # Default to lib on macOS/Linux, bin on Windows.
         import sys
         return (os.path.join(llvm_home, "bin") if sys.platform == "win32"
                 else os.path.join(llvm_home, "lib"))
+
+    def _wire_llvm_ffigen_includes(self, llvm_home):
+        """Give ffigen/libclang host + Dart headers when using portable LLVM.
+
+        The clang+llvm tarball ships libclang but not the host C library
+        headers. Without CPATH, ffigen fails on stdbool.h and emits broken
+        bindings such as `typedef bool = NativeFunction<...>` which shadows
+        Dart's bool and tanks the Flutter build.
+        """
+        parts = []
+        # clang resource dir inside the toolchains LLVM (stddef.h, etc.)
+        lib_clang = os.path.join(llvm_home, "lib", "clang")
+        if os.path.isdir(lib_clang):
+            for ver in sorted(os.listdir(lib_clang), reverse=True):
+                cand = os.path.join(lib_clang, ver, "include")
+                if os.path.isdir(cand):
+                    parts.append(cand)
+                    break
+        # host system headers
+        for d in (
+            "/usr/include",
+            "/usr/include/x86_64-linux-gnu",
+            "/usr/include/aarch64-linux-gnu",
+            "/usr/include/arm-linux-gnueabihf",
+        ):
+            if os.path.isdir(d):
+                parts.append(d)
+        # gcc / system-clang builtin headers (stdbool.h on Debian/Ubuntu)
+        for base in (
+            "/usr/lib/gcc",
+            "/usr/lib/llvm-19/lib/clang",
+            "/usr/lib/llvm-18/lib/clang",
+            "/usr/lib/llvm-17/lib/clang",
+            "/usr/lib/llvm-15/lib/clang",
+        ):
+            if not os.path.isdir(base):
+                continue
+            found = None
+            for root, _dirs, files in os.walk(base):
+                if "stdbool.h" in files:
+                    found = root
+                    break
+            if found:
+                parts.append(found)
+                break
+        # Flutter/Dart SDK headers for dart_api.h (prefer toolchains Flutter)
+        flutter_candidates = [
+            os.path.join(self._project_root(), ".toolchains", "flutter",
+                         "flutter", "bin", "cache", "dart-sdk", "include"),
+        ]
+        which_flutter = shutil.which("flutter", path=self._effective_path())
+        if which_flutter:
+            # .../bin/flutter → .../bin/cache/dart-sdk/include
+            flutter_candidates.append(os.path.normpath(os.path.join(
+                os.path.dirname(which_flutter), "cache", "dart-sdk", "include")))
+        for dart_inc in flutter_candidates:
+            if os.path.isdir(dart_inc):
+                parts.append(dart_inc)
+                third = os.path.join(dart_inc, "third_party")
+                if os.path.isdir(third):
+                    parts.append(third)
+                break
+
+        # de-dupe, keep order
+        seen, uniq = set(), []
+        for p in parts:
+            ap = os.path.abspath(p)
+            if ap not in seen and os.path.isdir(ap):
+                seen.add(ap)
+                uniq.append(ap)
+        if not uniq:
+            self._ffigen_cpath = ""
+            return
+        # Store for generate_bridge() to pass locally to the codegen command.
+        # Do NOT set CPATH/C_INCLUDE_PATH in os.environ here — those are global
+        # and would leak Clang-specific headers into GCC compilations (zstd-sys,
+        # ring, etc.) causing "missing binary operator" errors in xmmintrin.h.
+        self._ffigen_cpath = os.pathsep.join(uniq)
+        self.log(f"  · ffigen CPATH prepared for toolchains LLVM ({len(uniq)} dirs)")
 
     def _host_rust_triple(self):
         """Rustup host triple for this machine (the runnable toolchain)."""
@@ -291,39 +403,94 @@ class Build:
             self.log("  ! could not resolve macOS SDK path via xcrun "
                      "(bindgen may fail to find system headers)")
 
+    def _ensure_sccache(self):
+        """If sccache is installed, set RUSTC_WRAPPER so cargo uses it.
+
+        sccache caches Rust compilation artifacts across builds, dramatically
+        reducing rebuild times. It's optional — if not installed, builds
+        proceed normally without caching."""
+        sccache = shutil.which("sccache", path=self._effective_path())
+        if sccache:
+            os.environ["RUSTC_WRAPPER"] = "sccache"
+            self.log(f"  · sccache enabled ({sccache})")
+        else:
+            # Don't override an explicit user choice, but clear stale wrapper
+            if os.environ.get("RUSTC_WRAPPER") == "sccache":
+                del os.environ["RUSTC_WRAPPER"]
+            self.log("  · sccache not found — builds will run without cache. "
+                     "Install it via the Toolchain tab or: cargo install sccache")
+
+    def _log_sccache_stats(self):
+        """Print sccache cache statistics after all builds complete."""
+        sccache = shutil.which("sccache", path=self._effective_path())
+        if not sccache:
+            return
+        if os.environ.get("RUSTC_WRAPPER") != "sccache":
+            return
+        self.log("\n=== sccache statistics ===")
+        for args in (["--show-stats"], ["--show-adv-stats"]):
+            try:
+                out = subprocess.run(
+                    [sccache] + args,
+                    capture_output=True, text=True, timeout=15,
+                    env={**os.environ, "PATH": self._effective_path()},
+                )
+                if out.stdout.strip():
+                    for line in out.stdout.strip().splitlines():
+                        self.log(f"  {line}")
+                if out.stderr.strip():
+                    self.log(f"  (stderr) {out.stderr.strip()}")
+            except Exception as e:
+                self.log(f"  ! could not run sccache {' '.join(args)}: {e}")
+
     def _ensure_llvm(self):
-        """Ensure LIBCLANG_PATH points at LLVM 15.0.6 so ffigen/bindgen work.
-        Must run BEFORE generate_bridge() — ffigen needs libclang to
-        generate proper Dart bindings. Without it, the codegen emits dummy
-        code with unresolvable Dart_Handle type (E0412 build error)."""
+        """Always prefer LLVM from .toolchains/llvm for bindgen/ffigen.
+
+        Must run BEFORE generate_bridge() — ffigen needs libclang from the
+        portable LLVM 15.0.6 tree. Without it (or without host headers on
+        CPATH), the codegen emits dummy/broken Dart bindings.
+
+        Policy: if `.toolchains/llvm` is installed, it ALWAYS wins over any
+        pre-existing LIBCLANG_PATH / system clang so builds stay reproducible.
+        """
         # Always wire the Apple SDK first on macOS — even if LIBCLANG_PATH is
         # already set, bindgen still needs a sysroot for stdlib.h etc.
         self._ensure_macos_sdk()
+        self._llvm_home = None
 
-        libclang = os.environ.get("LIBCLANG_PATH", "")
-        if libclang and self._has_libclang(libclang):
-            self.log(f"  · LIBCLANG_PATH = {libclang}")
-            return
-        if libclang and os.path.isdir(libclang):
-            self.log(f"  ! LIBCLANG_PATH={libclang} does not contain libclang;"
-                     f" searching for the installed LLVM")
-
-        project_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), ".."))
-        tc_llvm = os.path.join(project_root, ".toolchains", "llvm")
-        # The archive may nest one level (e.g. clang+llvm-15.0.6-.../ on macOS).
-        llvm_home = self._find_llvm_home(tc_llvm)
+        # 1) Prefer the portable toolchains LLVM — always, when present.
+        llvm_home = self._toolchains_llvm_home()
         if llvm_home:
             libdir = self._libclang_dir(llvm_home)
             bindir = os.path.join(llvm_home, "bin")
+            prev = os.environ.get("LIBCLANG_PATH", "")
             os.environ["LIBCLANG_PATH"] = libdir
-            # Prepend bin to PATH so clang resolves to 15.0.6, not a system 22.x
+            # Prepend toolchains clang so PATH resolves to 15.0.6, not system 19+.
             if os.path.isdir(bindir):
-                os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
-            self.log(f"  · set LIBCLANG_PATH = {libdir}")
+                path_parts = [
+                    p for p in os.environ.get("PATH", "").split(os.pathsep)
+                    if p and p != bindir
+                ]
+                os.environ["PATH"] = os.pathsep.join([bindir] + path_parts)
+            self._llvm_home = llvm_home
+            self._wire_llvm_ffigen_includes(llvm_home)
+            if prev and os.path.abspath(prev) != os.path.abspath(libdir):
+                self.log(f"  · overriding LIBCLANG_PATH ({prev}) with toolchains LLVM")
+            self.log(f"  · toolchains LLVM: {llvm_home}")
+            self.log(f"  · LIBCLANG_PATH = {libdir}")
             return
 
-        # No auto-installed LLVM — check system clang version
+        # 2) Fall back to whatever is already on the environment.
+        libclang = os.environ.get("LIBCLANG_PATH", "")
+        if libclang and self._has_libclang(libclang):
+            self._llvm_home = os.path.dirname(libclang.rstrip(os.sep))
+            self.log(f"  · LIBCLANG_PATH = {libclang} "
+                     f"(no .toolchains/llvm — using existing env)")
+            return
+        if libclang and os.path.isdir(libclang):
+            self.log(f"  ! LIBCLANG_PATH={libclang} does not contain libclang")
+
+        # 3) System clang only as a last resort (and warn if not 15.0.6).
         clang = shutil.which("clang", path=self._effective_path())
         if clang:
             try:
@@ -333,19 +500,19 @@ class Build:
                 self.log(f"  · system clang: {vout.splitlines()[0]}")
                 if "15.0.6" not in vout:
                     self.log("  ! WARNING: LLVM 15.0.6 is pinned by the official "
-                             "CI. A different version may cause bindgen/libclang "
-                             "issues. Use the Install Tools tab to auto-install "
-                             "LLVM 15.0.6, or install it manually and set "
-                             "LIBCLANG_PATH to the directory containing "
-                             "libclang.dylib/so/dll.")
+                             "CI. Install it via the Toolchain tab into "
+                             ".toolchains/llvm so builds always use that copy.")
             except Exception:
                 pass
         else:
-            self.log("  ! clang not found — LLVM 15.0.6 is required for ffigen. "
-                     "Use the Install Tools tab to auto-install it.")
+            self.log("  ! clang not found — install LLVM 15.0.6 via the "
+                     "Toolchain tab (.toolchains/llvm).")
 
     def generate_bridge(self):
         self.log("\n=== 2. Generate flutter_rust_bridge ===")
+        # Re-assert toolchains LLVM right before codegen so a later step
+        # cannot have clobbered LIBCLANG_PATH.
+        self._ensure_llvm()
         # Mirrors the generate-bridge job. cargo installs the codegen binary into
         # ~/.cargo/bin, which run() puts on PATH so it resolves on Windows too.
         self.run(["cargo", "install", "flutter_rust_bridge_codegen",
@@ -371,17 +538,24 @@ class Build:
                "--rust-input", "./src/flutter_ffi.rs",
                "--dart-output", "./flutter/lib/generated_bridge.dart",
                "--c-output", "./flutter/macos/Runner/bridge_generated.h"]
-        # ffigen (run by the codegen) needs to find libclang.dll. It does NOT
-        # check LIBCLANG_PATH — it only looks at the llvm-path config key, which
-        # the codegen hardcodes with default paths (C:/Program Files/llvm, etc.).
-        # Pass --llvm-path so our .toolchains/llvm is included in the search.
-        libclang = os.environ.get("LIBCLANG_PATH", "")
-        if libclang:
-            llvm_root = os.path.dirname(libclang)  # bin/ -> llvm root
-            if os.path.isdir(libclang):
-                cmd += ["--llvm-path", llvm_root]
-                self.log(f"  · passing --llvm-path {llvm_root} to codegen")
-        self.run(cmd, cwd=self.src_dir, check=False)
+        # ffigen does NOT honour LIBCLANG_PATH — it searches --llvm-path.
+        # Always point it at the toolchains (or resolved) LLVM home.
+        llvm_home = getattr(self, "_llvm_home", None) or self._toolchains_llvm_home()
+        if llvm_home and os.path.isdir(llvm_home):
+            cmd += ["--llvm-path", llvm_home]
+            self.log(f"  · passing --llvm-path {llvm_home} to codegen")
+        else:
+            self.log("  ! no toolchains LLVM home for --llvm-path; ffigen may "
+                     "produce broken bindings (typedef bool poison / dummy code)")
+        # Pass CPATH/C_INCLUDE_PATH only to the codegen subprocess so ffigen
+        # can find stdbool.h etc.  These must NOT leak into the global env —
+        # Clang-specific headers break GCC compilations of zstd-sys / ring.
+        codegen_env = {}
+        ffigen_cpath = getattr(self, "_ffigen_cpath", "")
+        if ffigen_cpath:
+            codegen_env["CPATH"] = ffigen_cpath
+            codegen_env["C_INCLUDE_PATH"] = ffigen_cpath
+        self.run(cmd, cwd=self.src_dir, check=False, env=codegen_env)
 
     def customize_for(self, platform):
         if self.dry_run:
@@ -1127,6 +1301,7 @@ class Build:
 
             self.checkout_source()
             self._ensure_rust()
+            self._ensure_sccache()
             self._ensure_llvm()
             self.generate_bridge()
 
@@ -1140,6 +1315,8 @@ class Build:
             for p in plats:
                 self._check_cancel()
                 dispatch[p]()
+
+            self._log_sccache_stats()
 
             elapsed = int(time.time() - start)
             self.log(f"\n=== DONE in {elapsed//60}m {elapsed%60}s ===")

@@ -260,6 +260,14 @@ def check_appimage_builder():
     return _status(False, hint=_install_hint("appimage_builder"))
 
 
+def check_sccache():
+    p = _which("sccache")
+    if not p:
+        return _status(False, hint=_install_hint("sccache"))
+    ver = _run_version(["sccache", "--version"]) or "sccache"
+    return _status(True, ver, p, note="Optional: speeds up Rust/C++ rebuilds significantly.")
+
+
 CHECKS = {
     "git": check_git,
     "python": check_python,
@@ -275,6 +283,7 @@ CHECKS = {
     "xcode": check_xcode,
     "rpmbuild": check_rpmbuild,
     "appimage_builder": check_appimage_builder,
+    "sccache": check_sccache,
 }
 
 LABELS = {
@@ -292,6 +301,7 @@ LABELS = {
     "xcode": "Xcode command-line tools",
     "rpmbuild": "rpmbuild (RPM packaging)",
     "appimage_builder": "appimage-builder (AppImage packaging)",
+    "sccache": "sccache (Rust/C++ compilation cache)",
 }
 
 
@@ -367,6 +377,11 @@ def _install_hint(tool):
         },
         "appimage_builder": {
             "Linux": "sudo apt install libarchive-tools libfuse2 && sudo pip3 install setuptools_scm<10 && sudo pip3 install git+https://github.com/rustdesk-org/appimage-builder.git",
+        },
+        "sccache": {
+            "Windows": "cargo install sccache",
+            "Linux": "cargo install sccache",
+            "macOS": "cargo install sccache",
         },
     }
     return hints.get(tool, {}).get(os_name, "")

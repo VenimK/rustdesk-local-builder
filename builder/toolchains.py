@@ -43,6 +43,7 @@ SIZE_HINTS = {
     "vcpkg":       {"download": "~10 MB",  "disk": "~600 MB", "version": "pinned"},
     "rust":        {"download": "~250 MB", "disk": "~800 MB", "version": "1.75"},
     "vs_buildtools": {"download": "~4 MB", "disk": "~4-6 GB", "version": "2022 (C++)"},
+    "sccache":     {"download": "~30 MB",  "disk": "~100 MB", "version": "0.11.0"},
 }
 
 WIN = platform.system() == "Windows"
@@ -144,12 +145,19 @@ TOOLS = {
             ("Windows", "x86_64"): ("https://aka.ms/vs/17/release/vs_BuildTools.exe", "vs"),
         },
     },
+    # sccache — shared compilation cache for Rust/C/C++. Installed via cargo,
+    # works on all platforms. Set RUSTC_WRAPPER=sccache to speed up rebuilds.
+    "sccache": {
+        "label": "sccache (Rust/C++ compilation cache)",
+        "kind": "cargo",
+        "version": "0.11.0",
+    },
 }
 
 # which detection id each tool satisfies (prereqs.py ids)
 SATISFIES = {"flutter": "flutter", "llvm": "llvm", "android_ndk": "android_ndk",
              "java": "java", "vcpkg": "vcpkg", "rust": "rust",
-             "vs_buildtools": "msbuild"}
+             "vs_buildtools": "msbuild", "sccache": "sccache"}
 
 
 def tools_dir(root):
@@ -232,6 +240,9 @@ def installable(host_os=None, host_arch=None):
         elif spec["kind"] == "vs":
             if host_os != "Windows":
                 ok, reason = False, "Visual Studio Build Tools are Windows-only"
+        elif spec["kind"] == "cargo":
+            if not shutil.which("cargo"):
+                ok, reason = False, "Rust/cargo is required to install this"
         out[tid] = {"label": spec["label"], "ok": ok, "reason": reason}
     return out
 
@@ -356,6 +367,8 @@ def _env_for(tid, home):
         return {"vars": {"ANDROID_NDK_HOME": home, "ANDROID_NDK_ROOT": home}, "path": []}
     if tid == "vcpkg":
         return {"vars": {"VCPKG_ROOT": home}, "path": [home]}
+    if tid == "sccache":
+        return {"vars": {"RUSTC_WRAPPER": "sccache"}, "path": []}
     return {"vars": {}, "path": []}
 
 
@@ -371,6 +384,28 @@ def install_one(tid, root, log, cancelled=lambda: False):
     home_target = os.path.join(base, tid)
 
     log(f"\n=== Installing {spec['label']} ===")
+
+    if spec["kind"] == "cargo":
+        # Tools installed via `cargo install` (e.g. sccache).
+        # They land in ~/.cargo/bin, which is already on PATH via the rust env.
+        # Pin versions compatible with our oldest Rust (1.75).
+        pinned_ver = spec.get("version")
+        if shutil.which(tid + EXE):
+            log(f"  ✓ {tid} already installed")
+        else:
+            if pinned_ver:
+                log(f"  cargo install {tid} --version {pinned_ver} --locked")
+                rc = subprocess.call(["cargo", "install", tid,
+                                      "--version", pinned_ver, "--locked"])
+            else:
+                log(f"  cargo install {tid} --locked")
+                rc = subprocess.call(["cargo", "install", tid, "--locked"])
+            if rc != 0:
+                raise RuntimeError(f"cargo install {tid} failed")
+        cargo_bin = os.path.join(os.path.expanduser("~"), ".cargo", "bin")
+        env = _env_for(tid, cargo_bin)
+        log(f"  ✓ {tid} ready at {cargo_bin}")
+        return {"tool": tid, "home": cargo_bin, "env": env}
 
     if spec["kind"] == "rust":
         # Download rustup-init and install 1.75 per-user (~/.cargo, ~/.rustup).
@@ -558,17 +593,42 @@ def _load_env(root):
 def apply_persisted_env(root):
     """Call at startup: set vars + prepend PATH so detection sees local tools.
 
-    Self-heals a common stale LIBCLANG_PATH that points at LLVM's bin/ instead
-    of lib/ (bindgen needs the directory that contains libclang.dylib/so/dll).
+    Self-heals:
+      - relative paths in env.json (resolve against app root) so subprocesses
+        with a different cwd still find .toolchains tools
+      - stale LIBCLANG_PATH pointing at LLVM bin/ instead of lib/
+      - prefers absolute paths under .toolchains/
     """
+    root = os.path.abspath(root)
+
+    def _abspath(p):
+        if not p:
+            return p
+        if os.path.isabs(p):
+            return os.path.normpath(p)
+        # strip leading ./
+        p2 = p[2:] if p.startswith("./") or p.startswith(".\\") else p
+        return os.path.normpath(os.path.join(root, p2))
+
     d = _load_env(root)
-    vars_ = d.get("vars", {})
+    vars_ = {k: _abspath(v) for k, v in d.get("vars", {}).items()}
+    paths = [_abspath(p) for p in d.get("path", [])]
+
     libclang = vars_.get("LIBCLANG_PATH")
     if libclang:
         names = ("libclang.dylib", "libclang.so", "libclang.dll",
                  "libclang.so.15", "libclang.so.16", "libclang.so.17")
         def _has(dpath):
-            return any(os.path.isfile(os.path.join(dpath, n)) for n in names)
+            if not dpath or not os.path.isdir(dpath):
+                return False
+            if any(os.path.isfile(os.path.join(dpath, n)) for n in names):
+                return True
+            try:
+                return any(n.startswith("libclang.so.")
+                           for n in os.listdir(dpath)
+                           if os.path.isfile(os.path.join(dpath, n)))
+            except OSError:
+                return False
         if not _has(libclang):
             # try sibling lib/ (or bin/ on Windows) next to a mistaken path
             parent = os.path.dirname(libclang.rstrip(os.sep))
@@ -577,23 +637,52 @@ def apply_persisted_env(root):
                          parent):
                 if _has(cand):
                     vars_["LIBCLANG_PATH"] = cand
-                    d["vars"] = vars_
-                    try:
-                        with open(env_path(root), "w") as f:
-                            json.dump(d, f, indent=2)
-                            f.write("\n")
-                    except Exception:
-                        pass
                     break
+        # Prefer toolchains LLVM lib/ when it exists, even if env.json points
+        # somewhere else (keeps builds pinned to the portable install).
+        tc_llvm = os.path.join(root, ".toolchains", "llvm")
+        if os.path.isdir(tc_llvm):
+            # one-level nesting from the tarball
+            homes = [tc_llvm]
+            try:
+                homes += [
+                    os.path.join(tc_llvm, n)
+                    for n in os.listdir(tc_llvm)
+                    if os.path.isdir(os.path.join(tc_llvm, n, "bin"))
+                ]
+            except OSError:
+                pass
+            for home in homes:
+                for sub in ("lib", "bin"):
+                    cand = os.path.join(home, sub)
+                    if _has(cand):
+                        vars_["LIBCLANG_PATH"] = cand
+                        break
+                else:
+                    continue
+                break
+
+    # Persist self-healed absolute paths so next launch is clean.
+    healed = {"vars": vars_, "path": paths}
+    if healed != {"vars": d.get("vars", {}), "path": d.get("path", [])}:
+        try:
+            os.makedirs(tools_dir(root), exist_ok=True)
+            with open(env_path(root), "w") as f:
+                json.dump(healed, f, indent=2)
+                f.write("\n")
+        except Exception:
+            pass
+
     for k, v in vars_.items():
-        os.environ[k] = v
-    if d.get("path"):
+        if v:
+            os.environ[k] = v
+    if paths:
         sep = os.pathsep
         existing = os.environ.get("PATH", "")
-        prepend = sep.join(p for p in d["path"] if os.path.isdir(p))
+        prepend = sep.join(p for p in paths if os.path.isdir(p))
         if prepend:
             os.environ["PATH"] = prepend + sep + existing
-    return d
+    return healed
 
 
 if __name__ == "__main__":
