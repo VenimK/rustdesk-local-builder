@@ -171,6 +171,20 @@ class Build:
         if os.path.exists(self.src_dir):
             self.log(f"  clearing previous source at {self.src_dir}")
             if not self.dry_run:
+                # Docker builds can leave the dir with d-w------- (no read/execute),
+                # so rmtree can't traverse it. Fix permissions top-down first.
+                try:
+                    import stat
+                    os.chmod(self.src_dir, stat.S_IRWXU)
+                    for root, dirs, files in os.walk(self.src_dir, topdown=False):
+                        for name in dirs + files:
+                            p = os.path.join(root, name)
+                            try:
+                                os.chmod(p, stat.S_IRWXU)
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
                 shutil.rmtree(self.src_dir, ignore_errors=True)
                 # a leftover read-only .git on Windows can resist removal
                 if os.path.exists(self.src_dir):
@@ -1112,10 +1126,19 @@ class Build:
         self.run([self._py(), "build.py", "--flutter", "--hwcodec"],
                  cwd=self.src_dir, check=False)
         env = self._env()
+        app_name = self.config.get("appname", "RustDesk") or "RustDesk"
         app_dir = os.path.join(self.src_dir, "flutter", "build", "macos",
                                "Build", "Products", "Release")
+        app_bundle = os.path.join(app_dir, f"{app_name}.app")
         if os.path.isdir(app_dir):
+            # Write custom_.txt next to the .app (Category B — runtime pickup)
             customize.write_custom_txt(app_dir, env, log=self.log)
+        if os.path.isdir(app_bundle):
+            # Also write custom_.txt INSIDE the app bundle's Contents/Resources/
+            # so it travels with the .app inside the DMG (matches VenimK workflow).
+            resources_dir = os.path.join(app_bundle, "Contents", "Resources")
+            os.makedirs(resources_dir, exist_ok=True)
+            customize.write_custom_txt(resources_dir, env, log=self.log)
         self._create_macos_dmg()
         self._collect(self.src_dir, (".dmg",), "macos")
 

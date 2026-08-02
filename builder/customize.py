@@ -160,7 +160,7 @@ def _apply_appname(src, env, platform, log):
     log(f"  App name -> {app}")
     for rs in find_files(src, "src/lang", ".rs"):
         rel = os.path.relpath(rs, src)
-        sed(src, rel, "RustDesk", app)
+        sed_regex(src, rel, r"RustDesk", app, log=log, flags=re.IGNORECASE)
     # Slogan_tip doesn't contain "RustDesk" — patch it in every lang file
     slogan = env.get("CUSTOM_SLOGAN", "") or f"Powered by {app}"
     for rs in find_files(src, "src/lang", ".rs"):
