@@ -12,6 +12,7 @@ baked-in config, and runs the build locally with a live console — the same
 customizations the GitHub Actions builder applies, minus GitHub.
 """
 
+import base64
 import json
 import os
 import platform
@@ -30,6 +31,7 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 WEB_DIR = os.path.join(ROOT, "web")
 CONFIG_PATH = os.path.join(ROOT, "configs", "RustDesk.json")
 WORKSPACE = os.path.join(ROOT, "workspace")
+BRANDING_DIR = os.path.join(WORKSPACE, "branding")
 
 # apply any locally-installed toolchains (.toolchains/env.json) so detection
 # below sees them — must run before the first prereqs scan.
@@ -60,8 +62,6 @@ class BuildSession:
     def _emit(self, line):
         with self.lock:
             self.history.append(line)
-            if len(self.history) > 8000:      # bound memory + reconnect replay
-                del self.history[:len(self.history) - 8000]
             for q in list(self.subscribers):
                 q.put(line)
 
@@ -120,8 +120,6 @@ class InstallSession:
     def _emit(self, line):
         with self.lock:
             self.history.append(line)
-            if len(self.history) > 8000:      # bound memory + reconnect replay
-                del self.history[:len(self.history) - 8000]
             for q in list(self.subscribers):
                 q.put(line)
 
@@ -250,6 +248,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/toolchains/status":
             return self._send_json({"running": INSTALL.running,
                                     "result": INSTALL.result})
+        if path.startswith("/api/branding/"):
+            return self._serve_branding(path)
         return self._serve_static(path)
 
     # ---- POST ----
@@ -320,6 +320,25 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._send_json({"error": str(e)}, 500)
 
+        if path == "/api/upload":
+            file_type = data.get("type", "")  # "icon" or "logo"
+            file_data = data.get("data", "")  # base64-encoded file content
+            filename = data.get("filename", f"{file_type}.png")
+            if not file_type or not file_data:
+                return self._send_json({"error": "missing type or data"}, 400)
+            os.makedirs(BRANDING_DIR, exist_ok=True)
+            # sanitize filename — only keep the extension
+            ext = os.path.splitext(filename)[1].lower() or ".png"
+            safe_name = f"{file_type}{ext}"
+            dst = os.path.join(BRANDING_DIR, safe_name)
+            try:
+                with open(dst, "wb") as f:
+                    f.write(base64.b64decode(file_data))
+            except Exception as e:
+                return self._send_json({"error": str(e)}, 500)
+            return self._send_json({"ok": True, "path": dst,
+                                    "filename": safe_name})
+
         return self._send_json({"error": "not found"}, 404)
 
     # ---- SSE stream (shared by build + install) ----
@@ -351,6 +370,27 @@ class Handler(BaseHTTPRequestHandler):
             pass
         finally:
             session.unsubscribe(q)
+
+    # ---- branding files (uploaded icons/logos) ----
+    def _serve_branding(self, path):
+        # path is like /api/branding/icon.png
+        name = os.path.basename(path)
+        full = os.path.join(BRANDING_DIR, name)
+        if not os.path.isfile(full):
+            self.send_error(404)
+            return
+        ext = os.path.splitext(full)[1].lower()
+        ctype = {".png": "image/png", ".svg": "image/svg+xml",
+                 ".ico": "image/x-icon", ".jpg": "image/jpeg",
+                 ".jpeg": "image/jpeg"}.get(ext, "application/octet-stream")
+        with open(full, "rb") as f:
+            body = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
 
     # ---- static files ----
     def _serve_static(self, path):
