@@ -250,6 +250,7 @@ function fillConfig(cfg) {
     if (el.type === "checkbox") el.checked = truthy(cfg[k]);
     else el.value = cfg[k] ?? "";
   });
+  restoreBrandingPreview(cfg);
   refreshPreview();
 }
 
@@ -278,6 +279,9 @@ async function refreshPreview() {
   $("#env-preview").textContent =
     `server : ${e.CUSTOM_SERVER}\nkey    : ${e.CUSTOM_KEY}\napi    : ${e.CUSTOM_API_SERVER}\n` +
     `app    : ${e.CUSTOM_APPNAME}\ncompany: ${e.CUSTOM_COMPNAME}\n` +
+    `slogan : ${e.CUSTOM_SLOGAN || "(default: Powered by " + e.CUSTOM_APPNAME + ")"}\n` +
+    `icon   : ${e.CUSTOM_ICON_FILE ? e.CUSTOM_ICON_FILE.split("/").pop() : "(default)"}\n` +
+    `logo   : ${e.CUSTOM_LOGO_FILE ? e.CUSTOM_LOGO_FILE.split("/").pop() : "(default)"}\n` +
     `flags  : delayFix=${e.CUSTOM_DELAY_FIX} hidecm=${e.CUSTOM_HIDE_CM} ` +
     `xOffline=${e.CUSTOM_X_OFFLINE}`;
 }
@@ -294,6 +298,70 @@ $("#btn-save-config").addEventListener("click", async () => {
   state.config = cfg;
   setTimeout(() => (note.textContent = ""), 2500);
 });
+
+/* ── branding uploads ─────────────────────────────────── */
+async function uploadBranding(file, type) {
+  const previewId = type + "-preview";
+  const clearId = type + "-clear";
+  const pathId = type + "-file-path";
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const b64 = reader.result.split(",")[1];
+    const r = await api("/api/upload", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type, data: b64, filename: file.name }),
+    });
+    if (r.ok) {
+      const ext = file.name.split(".").pop().toLowerCase();
+      const imgUrl = `/api/branding/${type}.${ext}?t=${Date.now()}`;
+      $("#" + previewId).innerHTML =
+        `<img src="${imgUrl}" alt="${esc(type)}"><span class="up-name">${esc(r.filename)}</span>`;
+      $("#" + clearId).hidden = false;
+      $("#" + pathId).value = r.path;
+      refreshPreview();
+    } else {
+      $("#" + previewId).innerHTML = `<span class="up-name">error: ${esc(r.error || "?")}</span>`;
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function clearBranding(type) {
+  const previewId = type + "-preview";
+  const clearId = type + "-clear";
+  const pathId = type + "-file-path";
+  $("#" + previewId).innerHTML = "";
+  $("#" + clearId).hidden = true;
+  $("#" + pathId).value = "";
+  $("#" + type + "-file").value = "";
+  refreshPreview();
+}
+
+$("#icon-file").addEventListener("change", e => {
+  if (e.target.files[0]) uploadBranding(e.target.files[0], "icon");
+});
+$("#logo-file").addEventListener("change", e => {
+  if (e.target.files[0]) uploadBranding(e.target.files[0], "logo");
+});
+$("#icon-clear").addEventListener("click", () => clearBranding("icon"));
+$("#logo-clear").addEventListener("click", () => clearBranding("logo"));
+
+function restoreBrandingPreview(cfg) {
+  for (const type of ["icon", "logo"]) {
+    const path = cfg[type + "File"];
+    const el = $("#" + type + "-preview");
+    const clear = $("#" + type + "-clear");
+    if (path) {
+      const ext = path.split(".").pop().toLowerCase();
+      const imgUrl = `/api/branding/${type}.${ext}?t=${Date.now()}`;
+      el.innerHTML = `<img src="${imgUrl}" alt="${type}"><span class="up-name">${esc(path.split("/").pop())}</span>`;
+      clear.hidden = false;
+    } else {
+      el.innerHTML = "";
+      clear.hidden = true;
+    }
+  }
+}
 
 document.addEventListener("input", e => {
   if (e.target.closest("#tab-config") && e.target.dataset.key) refreshPreview();

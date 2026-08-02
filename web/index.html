@@ -109,7 +109,28 @@
             <label>App name<input data-key="appname" placeholder="RustDesk = no rename"></label>
             <label>File name<input data-key="exename" placeholder="RustDesk"></label>
             <label>Company<input data-key="compname"></label>
+            <label>Slogan<input data-key="slogan" placeholder="blank = Powered by {appname}"></label>
             <label>Android app id<input data-key="androidappid" placeholder="blank = default"></label>
+          </fieldset>
+
+          <fieldset>
+            <legend>Branding</legend>
+            <div class="upload-row">
+              <div class="upload-item">
+                <label class="upload-label">App icon (PNG, 1024×1024 recommended)</label>
+                <input type="file" id="icon-file" accept="image/png,image/jpeg,image/svg+xml">
+                <div class="upload-preview" id="icon-preview"></div>
+                <button class="mini" id="icon-clear" hidden>remove</button>
+              </div>
+              <div class="upload-item">
+                <label class="upload-label">App logo (PNG or SVG, shown in About)</label>
+                <input type="file" id="logo-file" accept="image/png,image/jpeg,image/svg+xml">
+                <div class="upload-preview" id="logo-preview"></div>
+                <button class="mini" id="logo-clear" hidden>remove</button>
+              </div>
+            </div>
+            <input type="hidden" data-key="iconFile" id="icon-file-path">
+            <input type="hidden" data-key="logoFile" id="logo-file-path">
           </fieldset>
 
           <fieldset>
