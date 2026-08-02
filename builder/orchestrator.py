@@ -782,6 +782,14 @@ class Build:
         self.run([self._py(), "build.py", "--flutter", "--skip-cargo"],
                  cwd=self.src_dir, check=False)
 
+    def _output_basename(self):
+        """The custom file name for output artifacts (e.g. 'myapp-1.4.9').
+
+        Falls back to 'rustdesk' when no custom exename is set, matching
+        the upstream build.py behaviour."""
+        filename = self.config.get("exename", "") or self.config.get("appname", "") or "rustdesk"
+        return filename
+
     def _package_linux_rpm(self):
         """Package the flutter bundle into .rpm files.
 
@@ -793,6 +801,7 @@ class Build:
         import glob as _glob
         self.log("  · packaging .rpm")
         version = self.version
+        basename = self._output_basename()
         bundle = self._linux_bundle_dir()
         if not bundle:
             self.log("  ! no flutter linux bundle found — skipping .rpm")
@@ -824,19 +833,19 @@ class Build:
                      cwd=self.src_dir, check=False)
             # For aarch64, patch the hardcoded x64 bundle path
             if arch_seg != "x64":
-                self.run(["sed", "-i", f"s/linux\\/x64/linux\\/{arch_seg}/g", spec],
+                self.run(["sed", "-i", f"s/linux\/x64/linux\/{arch_seg}/g", spec],
                          cwd=self.src_dir, check=False)
             # Build binary RPM only (-bb), matching CI
             self.run([rpm_tool, "-bb", spec],
                      cwd=self.src_dir, check=False,
                      env=rpm_env)
-            # Collect the built RPM
+            # Collect the built RPM (rpmbuild always names it rustdesk-*.rpm)
             rpm_glob = os.path.expanduser(
                 f"~/rpmbuild/RPMS/{arch}/rustdesk-*.rpm")
             rpms = _glob.glob(rpm_glob)
             if rpms:
                 dest = os.path.join(
-                    self.src_dir, f"rustdesk-{version}{suffix}.rpm")
+                    self.src_dir, f"{basename}-{version}{suffix}.rpm")
                 shutil.move(rpms[0], dest)
                 built.append(dest)
                 self.log(f"  ✓ created {os.path.basename(dest)}")
@@ -853,8 +862,9 @@ class Build:
         """
         self.log("  · packaging .AppImage")
         version = self.version
+        basename = self._output_basename()
         # appimage-builder needs a .deb to extract — build it first if we
-        # haven't already.
+        # haven't already.  build.py always produces rustdesk-{ver}.deb.
         deb_path = os.path.join(self.src_dir, f"rustdesk-{version}.deb")
         if not os.path.isfile(deb_path):
             self.log("  · .deb not found, building it first for AppImage")
@@ -898,9 +908,9 @@ class Build:
             # fallback: any AppImage in the dir
             imgs = _glob.glob(os.path.join(appimage_dir, "*.AppImage"))
         if imgs:
-            dest = os.path.join(self.src_dir, f"rustdesk-{version}.AppImage")
+            dest = os.path.join(self.src_dir, f"{basename}-{version}.AppImage")
             shutil.move(imgs[0], dest)
-            self.log(f"  ✓ created rustdesk-{version}.AppImage")
+            self.log(f"  ✓ created {basename}-{version}.AppImage")
         else:
             self.log("  ! AppImage not found after build")
 
@@ -1098,6 +1108,7 @@ class Build:
                       "--toolchain", toolchain], check=False)
         self.run(["rustup", "default", toolchain], check=False)
         self._patch_macos_podfile()
+        self._patch_macos_build_py()
         self.run([self._py(), "build.py", "--flutter", "--hwcodec"],
                  cwd=self.src_dir, check=False)
         env = self._env()
@@ -1205,6 +1216,32 @@ class Build:
             return "aarch64-apple-darwin"
         return "x86_64-apple-darwin"
 
+    def _patch_macos_build_py(self):
+        """Replace hardcoded RustDesk.app in build.py with the custom app name.
+
+        build.py line ~420 does:
+            cp -rf ../target/release/service ./build/macos/Build/Products/Release/RustDesk.app/Contents/MacOS/
+        When PRODUCT_NAME is customized, flutter build produces {App}.app, not
+        RustDesk.app, so that cp fails silently. Patch build.py to use the
+        configured app name.
+        """
+        if self.dry_run:
+            return
+        app_name = self.config.get("appname", "RustDesk") or "RustDesk"
+        if app_name == "RustDesk":
+            return
+        build_py = os.path.join(self.src_dir, "build.py")
+        if not os.path.isfile(build_py):
+            return
+        with open(build_py, "r", encoding="utf-8", errors="surrogateescape") as f:
+            text = f.read()
+        if "RustDesk.app" not in text:
+            return
+        text = text.replace("RustDesk.app", f"{app_name}.app")
+        with open(build_py, "w", encoding="utf-8", errors="surrogateescape") as f:
+            f.write(text)
+        self.log(f"  · patched build.py: RustDesk.app -> {app_name}.app")
+
     def _create_macos_dmg(self):
         """Create a .dmg from the built RustDesk.app using create-dmg.
 
@@ -1214,29 +1251,32 @@ class Build:
         if self.dry_run:
             self.log("  (would create .dmg)")
             return
+        app_name = self.config.get("appname", "RustDesk") or "RustDesk"
+        app_basename = f"{app_name}.app"
         app = os.path.join(self.src_dir, "flutter", "build", "macos",
-                           "Build", "Products", "Release", "RustDesk.app")
+                           "Build", "Products", "Release", app_basename)
         if not os.path.isdir(app):
-            self.log("  ! RustDesk.app not found — skipping DMG creation")
+            self.log(f"  ! {app_basename} not found — skipping DMG creation")
             return
         create_dmg = shutil.which("create-dmg", path=self._effective_path())
         if not create_dmg:
             self.log("  ! create-dmg not found — skipping DMG creation")
             return
         version = self.config.get("version", "")
-        dmg_name = f"rustdesk-{version}.dmg" if version else "rustdesk.dmg"
+        basename = self._output_basename()
+        dmg_name = f"{basename}-{version}.dmg" if version else f"{basename}.dmg"
         dmg_path = os.path.join(self.src_dir, dmg_name)
         flutter_dir = os.path.join(self.src_dir, "flutter")
-        tmp_dmg = os.path.join(flutter_dir, "rustdesk.dmg")
+        tmp_dmg = os.path.join(flutter_dir, f"{basename}.dmg")
         self.run([
             create_dmg,
-            "--volname", "RustDesk Installer",
+            "--volname", f"{app_name} Installer",
             "--window-pos", "200", "120",
             "--window-size", "800", "400",
             "--icon-size", "100",
             "--app-drop-link", "600", "185",
-            "--icon", "RustDesk.app", "200", "190",
-            "--hide-extension", "RustDesk.app",
+            "--icon", app_basename, "200", "190",
+            "--hide-extension", app_basename,
             tmp_dmg, app,
         ], cwd=flutter_dir, check=False)
         if os.path.isfile(tmp_dmg):
@@ -1250,6 +1290,7 @@ class Build:
             self.log(f"  (would collect {'/'.join(exts)} from {root})")
             return
         appname = self.config.get("appname", "RustDesk")
+        basename = self._output_basename()
         # Only collect files whose base name starts with the app name or
         # "rustdesk" — this avoids picking up dependency .deb files that
         # appimage-builder downloads into appimage/ and other build dirs.
@@ -1266,7 +1307,17 @@ class Build:
                 if not f.lower().startswith(prefixes):
                     continue
                 src = os.path.join(dp, f)
-                dest = os.path.join(self.out_dir, f)
+                # Rename artifacts to use the custom basename:
+                # - rustdesk-* -> {basename}-*  (Linux .deb/.rpm/.AppImage, macOS .dmg)
+                # - app-*.apk -> {basename}-*.apk  (Android split APKs)
+                # - app-release.apk -> {basename}-release.apk  (Android universal)
+                out_name = f
+                if basename.lower() != "rustdesk":
+                    if f.lower().startswith("rustdesk"):
+                        out_name = basename + f[len("rustdesk"):]
+                    elif f.lower().startswith("app-") and f.lower().endswith(".apk"):
+                        out_name = basename + f[3:]  # replace "app-" prefix
+                dest = os.path.join(self.out_dir, out_name)
                 shutil.copy2(src, dest)
                 self.artifacts.append(dest)
                 self.log(f"  ✓ artifact: {dest}")
@@ -1285,6 +1336,15 @@ class Build:
             shutil.rmtree(dest)
         shutil.copytree(root, dest, ignore=shutil.ignore_patterns(
             "appimage", "tmpdeb", ".git"))
+        # Rename rustdesk.exe to {filename}.exe inside the copied directory
+        # (Windows build produces rustdesk.exe unless CMakeLists was patched)
+        basename = self._output_basename()
+        if basename.lower() != "rustdesk":
+            old_exe = os.path.join(dest, "rustdesk.exe")
+            new_exe = os.path.join(dest, f"{basename}.exe")
+            if os.path.isfile(old_exe):
+                os.rename(old_exe, new_exe)
+                self.log(f"  · renamed rustdesk.exe -> {basename}.exe")
         self.artifacts.append(dest)
         self.log(f"  ✓ artifact: {dest}")
 

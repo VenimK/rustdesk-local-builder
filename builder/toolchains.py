@@ -44,6 +44,8 @@ SIZE_HINTS = {
     "rust":        {"download": "~250 MB", "disk": "~800 MB", "version": "1.75"},
     "vs_buildtools": {"download": "~4 MB", "disk": "~4-6 GB", "version": "2022 (C++)"},
     "sccache":     {"download": "~30 MB",  "disk": "~100 MB", "version": "0.11.0"},
+    "imagemagick": {"download": "~60 MB",  "disk": "~200 MB", "version": "7.x"},
+    "potrace":     {"download": "~1 MB",   "disk": "~5 MB",   "version": "1.16"},
 }
 
 WIN = platform.system() == "Windows"
@@ -152,12 +154,36 @@ TOOLS = {
         "kind": "cargo",
         "version": "0.11.0",
     },
+    # ImageMagick — needed for icon/logo resizing and ICO/ICNS generation.
+    # Installed via the system package manager (brew/apt/choco).
+    "imagemagick": {
+        "label": "ImageMagick (icon/logo branding)",
+        "kind": "package",
+        "marker": "magick",
+        "packages": {
+            "macOS":   ("brew", ["install", "imagemagick"]),
+            "Linux":   ("sudo", ["apt", "install", "-y", "imagemagick"]),
+            "Windows": ("choco", ["install", "-y", "imagemagick"]),
+        },
+    },
+    # potrace — converts PNG logos to SVG. Optional but useful.
+    "potrace": {
+        "label": "potrace (PNG→SVG logo conversion)",
+        "kind": "package",
+        "marker": "potrace",
+        "packages": {
+            "macOS":   ("brew", ["install", "potrace"]),
+            "Linux":   ("sudo", ["apt", "install", "-y", "potrace"]),
+            "Windows": ("choco", ["install", "-y", "potrace"]),
+        },
+    },
 }
 
 # which detection id each tool satisfies (prereqs.py ids)
 SATISFIES = {"flutter": "flutter", "llvm": "llvm", "android_ndk": "android_ndk",
              "java": "java", "vcpkg": "vcpkg", "rust": "rust",
-             "vs_buildtools": "msbuild", "sccache": "sccache"}
+             "vs_buildtools": "msbuild", "sccache": "sccache",
+             "imagemagick": "imagemagick", "potrace": "potrace"}
 
 
 def tools_dir(root):
@@ -243,6 +269,14 @@ def installable(host_os=None, host_arch=None):
         elif spec["kind"] == "cargo":
             if not shutil.which("cargo"):
                 ok, reason = False, "Rust/cargo is required to install this"
+        elif spec["kind"] == "package":
+            pkgs = spec.get("packages", {})
+            if (host_os, ) not in {(k[0],) for k in pkgs} and host_os not in pkgs:
+                ok, reason = False, f"no package install for {host_os}"
+            elif host_os in pkgs:
+                mgr = pkgs[host_os][0]
+                if not shutil.which(mgr):
+                    ok, reason = False, f"{mgr} not found — install {spec['label']} manually"
         out[tid] = {"label": spec["label"], "ok": ok, "reason": reason}
     return out
 
@@ -406,6 +440,25 @@ def install_one(tid, root, log, cancelled=lambda: False):
         env = _env_for(tid, cargo_bin)
         log(f"  ✓ {tid} ready at {cargo_bin}")
         return {"tool": tid, "home": cargo_bin, "env": env}
+
+    if spec["kind"] == "package":
+        # System package manager install (brew/apt/choco).
+        # The tool lands in the system PATH, not .toolchains — no env wiring needed.
+        host_os = _system()
+        mgr, args = spec["packages"][host_os]
+        if shutil.which(spec.get("marker", tid)):
+            log(f"  ✓ {tid} already installed")
+        else:
+            log(f"  running: {mgr} {' '.join(args)}")
+            rc = subprocess.call([mgr] + args)
+            if rc != 0:
+                raise RuntimeError(f"{mgr} install failed for {tid}")
+        # verify the binary is now on PATH
+        if shutil.which(spec.get("marker", tid)):
+            log(f"  ✓ {tid} installed via {mgr}")
+        else:
+            log(f"  ! {tid} install finished but binary not found on PATH")
+        return {"tool": tid, "home": "", "env": {"vars": {}, "path": []}}
 
     if spec["kind"] == "rust":
         # Download rustup-init and install 1.75 per-user (~/.cargo, ~/.rustup).

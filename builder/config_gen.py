@@ -30,6 +30,9 @@ def build_custom_env(cfg: dict) -> dict:
     url_link = d.get("urlLink", "") or "https://rustdesk.com"
     download_link = d.get("downloadLink", "") or "https://rustdesk.com/download"
     android_app_id = d.get("androidappid", "") or ""
+    slogan = d.get("slogan", "") or ""
+    icon_file = d.get("iconFile", "") or ""
+    logo_file = d.get("logoFile", "") or ""
 
     env = {
         "CUSTOM_APPNAME": appname,
@@ -41,6 +44,9 @@ def build_custom_env(cfg: dict) -> dict:
         "CUSTOM_URL_LINK": url_link,
         "CUSTOM_DOWNLOAD_LINK": download_link,
         "CUSTOM_ANDROID_APP_ID": android_app_id,
+        "CUSTOM_SLOGAN": slogan,
+        "CUSTOM_ICON_FILE": icon_file,
+        "CUSTOM_LOGO_FILE": logo_file,
         "CUSTOM_DELAY_FIX": _b(d.get("delayFix", False)),
         "CUSTOM_HIDE_CM": _b(d.get("hidecm", False)),
         "CUSTOM_X_OFFLINE": _b(d.get("xOffline", False)),

@@ -14,10 +14,14 @@ Everything routes through `apply(...)`, which takes the source dir, the target
 platform, the CUSTOM_* env dict, and a `log` callback for streaming progress.
 """
 
+import base64
+import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +143,16 @@ def _strip_signature_inline(src, log):
     log("    · signature check stripped (inline)")
 
 
+def _sanitize_bundle_id(app):
+    """Sanitize an app name into a valid macOS bundle ID component.
+
+    Reverse-DNS bundle IDs must be alphanumeric with dots and hyphens only.
+    Spaces become hyphens, everything else is stripped, lowercased.
+    """
+    sanitized = app.lower().replace(" ", "-")
+    return re.sub(r"[^a-z0-9.-]", "", sanitized)
+
+
 def _apply_appname(src, env, platform, log):
     app = env["CUSTOM_APPNAME"]
     if app.lower() == "rustdesk":
@@ -147,6 +161,20 @@ def _apply_appname(src, env, platform, log):
     for rs in find_files(src, "src/lang", ".rs"):
         rel = os.path.relpath(rs, src)
         sed(src, rel, "RustDesk", app)
+    # Slogan_tip doesn't contain "RustDesk" — patch it in every lang file
+    slogan = env.get("CUSTOM_SLOGAN", "") or f"Powered by {app}"
+    for rs in find_files(src, "src/lang", ".rs"):
+        rel = os.path.relpath(rs, src)
+        sed_regex(src, rel,
+                  r'("Slogan_tip",\s*")[^"]*(")',
+                  rf'\g<1>{slogan}\g<2>', log)
+    # "About" menu value (e.g. "Over" in Dutch) has no "RustDesk" to replace,
+    # so append the app name: "Over" -> "Over {app}"
+    for rs in find_files(src, "src/lang", ".rs"):
+        rel = os.path.relpath(rs, src)
+        sed_regex(src, rel,
+                  r'("Over",\s*")([^"]+)(")',
+                  rf'\g<1>\g<2> {app}\g<3>', log)
     if platform == "windows":
         sed(src, "Cargo.toml", 'description = "RustDesk Remote Desktop"',
             f'description = "{app}"', log)
@@ -155,6 +183,11 @@ def _apply_appname(src, env, platform, log):
         sed(src, "flutter/windows/runner/Runner.rc",
             'VALUE "InternalName", "rustdesk"',
             f'VALUE "InternalName", "{app}"', log)
+        # Patch CMakeLists.txt so the output .exe uses the custom filename
+        filename = env.get("CUSTOM_FILENAME", "") or app
+        if filename and filename != "RustDesk" and filename != "rustdesk":
+            cmake = "flutter/windows/runner/CMakeLists.txt"
+            sed(src, cmake, "rustdesk", filename, log)
     if platform == "android":
         sed(src, "Cargo.toml", 'description = "RustDesk Remote Desktop"', f'description = "{app}"', log)
         sed(src, "Cargo.toml", 'name = "RustDesk"', f'name = "{app}"', log)
@@ -170,9 +203,40 @@ def _apply_appname(src, env, platform, log):
         sed(src, f"{kt}/MainService.kt", '"RustDesk Service', f'"{app} Service', log)
         sed(src, "flutter/lib/main.dart", "RustDesk", app, log)
         sed(src, "libs/hbb_common/src/config.rs", '"RustDesk"', f'"{app}"', log)
+    if platform == "macos":
+        bundle_id = f"com.carriez.{_sanitize_bundle_id(app)}"
+        log(f"  macOS bundle ID -> {bundle_id}")
+        # AppInfo.xcconfig — product name and bundle identifier
+        sed(src, "flutter/macos/Runner/Configs/AppInfo.xcconfig",
+            "PRODUCT_NAME = RustDesk", f"PRODUCT_NAME = {app}", log)
+        sed(src, "flutter/macos/Runner/Configs/AppInfo.xcconfig",
+            "PRODUCT_BUNDLE_IDENTIFIER = com.carriez.flutterHbb",
+            f"PRODUCT_BUNDLE_IDENTIFIER = {bundle_id}", log)
+        # Info.plist — bundle identifier, URL scheme, display name
+        sed(src, "flutter/macos/Runner/Info.plist",
+            "com.carriez.rustdesk", bundle_id, log)
+        sed(src, "flutter/macos/Runner/Info.plist",
+            "<string>rustdesk</string>", f"<string>{_sanitize_bundle_id(app)}</string>", log)
+        sed_regex(src, "flutter/macos/Runner/Info.plist",
+                  r"(<key>CFBundleDisplayName</key>\s*<string>).*?(</string>)",
+                  rf"\g<1>{app}\g<2>", log)
+        sed_regex(src, "flutter/macos/Runner/Info.plist",
+                  r"(<key>NSMicrophoneUsageDescription</key>\s*<string>).*?(</string>)",
+                  rf"\g<1>{app} needs microphone access for audio sharing.\g<2>", log)
+        # project.pbxproj — bundle identifier (3 occurrences) and product name
+        sed(src, "flutter/macos/Runner.xcodeproj/project.pbxproj",
+            "PRODUCT_BUNDLE_IDENTIFIER = com.carriez.rustdesk",
+            f"PRODUCT_BUNDLE_IDENTIFIER = {bundle_id}", log)
+        sed(src, "flutter/macos/Runner.xcodeproj/project.pbxproj",
+            'PRODUCT_NAME = "RustDesk"', f'PRODUCT_NAME = "{app}"', log)
+        sed(src, "flutter/macos/Runner.xcodeproj/project.pbxproj",
+            "RustDesk.app", f"{app}.app", log)
+        # Cargo.toml — description (parity with windows/android)
+        sed(src, "Cargo.toml", 'description = "RustDesk Remote Desktop"',
+            f'description = "{app}"', log)
 
 
-def _apply_company(src, env, log):
+def _apply_company(src, env, platform, log):
     comp = env["CUSTOM_COMPNAME"]
     if not comp or comp == "Purslane Ltd":
         return
@@ -184,6 +248,11 @@ def _apply_company(src, env, log):
         sed(src, rel, "Purslane Tech Pte. Ltd.", comp)
         sed(src, rel, "Purslane Ltd", comp)
     sed(src, "res/msi/preprocess.py", "PURSLANE", comp)
+    if platform == "macos":
+        sed(src, "flutter/macos/Runner/Configs/AppInfo.xcconfig",
+            "Purslane Tech Pte. Ltd.", comp, log)
+        sed(src, "flutter/macos/Runner/Configs/AppInfo.xcconfig",
+            "Purslane Ltd", comp, log)
 
 
 def _apply_urls(src, env, log):
@@ -265,6 +334,275 @@ def write_custom_txt(dest_dir, env, log=None, filename="custom_.txt"):
 
 
 # ---------------------------------------------------------------------------
+# icon / logo branding (all platforms)
+# ---------------------------------------------------------------------------
+
+def _magick_resize(src_img, size, dst_img, log=None):
+    """Resize an image using ImageMagick (tries `magick` v7 then `convert` v6)."""
+    for cmd in ("magick", "convert"):
+        try:
+            subprocess.run([cmd, src_img, "-resize", f"{size}x{size}", dst_img],
+                           check=True, capture_output=True, timeout=30)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    if log:
+        log(f"    ! ImageMagick not found — cannot resize to {size}x{size}")
+    return False
+
+
+def _make_ico(src_img, dst_ico, log=None):
+    """Create a multi-resolution ICO (256,64,48,32,16) from a PNG via ImageMagick."""
+    for cmd in ("magick", "convert"):
+        try:
+            subprocess.run([cmd, src_img, "-define",
+                            "icon:auto-resize=256,64,48,32,16", dst_ico],
+                           check=True, capture_output=True, timeout=30)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    if log:
+        log("    ! ImageMagick not found — cannot create .ico")
+    return False
+
+
+def _make_icns(src_img, dst_icns, log=None):
+    """Create an .icns from a PNG using iconutil (macOS only)."""
+    iconset = tempfile.mkdtemp(suffix=".iconset")
+    sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
+             (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
+             (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+             (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
+             (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")]
+    for sz, name in sizes:
+        _magick_resize(src_img, sz, os.path.join(iconset, name), log)
+    try:
+        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", dst_icns],
+                       check=True, capture_output=True, timeout=30)
+        if log:
+            log(f"    · created {os.path.basename(dst_icns)} via iconutil")
+        return True
+    except Exception:
+        if log:
+            log("    ! iconutil failed — cannot create .icns")
+        return False
+    finally:
+        shutil.rmtree(iconset, ignore_errors=True)
+
+
+def _patch_ui_rs_icon(src, icon_path, log):
+    """Replace the base64-encoded icon PNG in src/ui.rs with the user's icon."""
+    with open(icon_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode()
+    # The icon appears as "data:image/png;base64,XXXX..." in ui.rs
+    ok = sed_regex(src, "src/ui.rs",
+                   r'(data:image/png;base64,)[^"]*',
+                   rf'\g<1>{b64}', log)
+    if not ok and log:
+        log("    ! ui.rs icon base64 pattern not found — skipping")
+    return ok
+
+
+def _apply_icon(src, env, platform, log):
+    """Replace app icons across all platforms, mirroring the VenimK workflows."""
+    icon_file = env.get("CUSTOM_ICON_FILE", "")
+    if not icon_file:
+        return
+    icon_abs = os.path.abspath(icon_file)
+    if not os.path.exists(icon_abs):
+        log(f"  ! icon file not found: {icon_file}")
+        return
+    log(f"  App icon -> {os.path.basename(icon_file)}")
+
+    res_dir = os.path.join(src, "res")
+    flutter_assets = os.path.join(src, "flutter", "assets")
+
+    # ── common: res/icon.png + resized PNGs + flutter/assets/icon.png ──
+    dst_icon_png = os.path.join(res_dir, "icon.png")
+    shutil.copy2(icon_abs, dst_icon_png)
+    log("    · res/icon.png")
+
+    for sz in (32, 64, 128):
+        _magick_resize(icon_abs, sz, os.path.join(res_dir, f"{sz}x{sz}.png"), log)
+
+    # 128x128@2x.png (256x256)
+    _magick_resize(icon_abs, 256, os.path.join(res_dir, "128x128@2x.png"), log)
+
+    # flutter/assets/icon.png
+    shutil.copy2(icon_abs, os.path.join(flutter_assets, "icon.png"))
+    log("    · flutter/assets/icon.png")
+
+    # rustdesk/data/flutter_assets/assets/icon.png (if exists)
+    fa2 = os.path.join(src, "rustdesk", "data", "flutter_assets", "assets")
+    if os.path.isdir(fa2):
+        shutil.copy2(icon_abs, os.path.join(fa2, "icon.png"))
+
+    # ── patch src/ui.rs base64 icon ──
+    _patch_ui_rs_icon(src, icon_abs, log)
+
+    # ── platform-specific ──
+    if platform == "windows":
+        _apply_icon_windows(src, icon_abs, res_dir, log)
+    elif platform == "macos":
+        _apply_icon_macos(src, icon_abs, res_dir, log)
+    elif platform == "android":
+        _apply_icon_android(src, icon_abs, res_dir, log)
+    elif platform == "linux":
+        _apply_icon_linux(src, icon_abs, res_dir, log)
+
+
+def _apply_icon_windows(src, icon, res_dir, log):
+    """Windows: .ico, tray icon, Runner.rc resource."""
+    # res/icon.ico
+    _make_ico(icon, os.path.join(res_dir, "icon.ico"), log)
+    # res/tray-icon.ico
+    shutil.copy2(os.path.join(res_dir, "icon.ico"),
+                 os.path.join(res_dir, "tray-icon.ico"))
+    log("    · res/tray-icon.ico")
+    # flutter/windows/runner/resources/app_icon.ico
+    runner_ico = os.path.join(src, "flutter", "windows", "runner",
+                              "resources", "app_icon.ico")
+    if os.path.exists(runner_ico):
+        shutil.copy2(os.path.join(res_dir, "icon.ico"), runner_ico)
+        log("    · flutter/windows/runner/resources/app_icon.ico")
+
+
+def _apply_icon_macos(src, icon, res_dir, log):
+    """macOS: .icns, appiconset, tray icons."""
+    # res/mac-icon.png (128x128)
+    _magick_resize(icon, 128, os.path.join(res_dir, "mac-icon.png"), log)
+
+    # flutter/macos/Runner/AppIcon.icns
+    icns_path = os.path.join(src, "flutter", "macos", "Runner", "AppIcon.icns")
+    _make_icns(icon, icns_path, log)
+
+    # AppIcon.appiconset (create if it doesn't exist)
+    appiconset = os.path.join(src, "flutter", "macos", "Runner",
+                              "Assets.xcassets", "AppIcon.appiconset")
+    os.makedirs(appiconset, exist_ok=True)
+    for sz in (16, 32, 64, 128, 256, 512, 1024):
+        _magick_resize(icon, sz,
+                       os.path.join(appiconset, f"app_icon_{sz}.png"), log)
+    # Contents.json
+    contents = {"images": [
+        {"size": "16x16", "idiom": "mac", "filename": "app_icon_16.png", "scale": "1x"},
+        {"size": "16x16", "idiom": "mac", "filename": "app_icon_32.png", "scale": "2x"},
+        {"size": "32x32", "idiom": "mac", "filename": "app_icon_32.png", "scale": "1x"},
+        {"size": "32x32", "idiom": "mac", "filename": "app_icon_64.png", "scale": "2x"},
+        {"size": "128x128", "idiom": "mac", "filename": "app_icon_128.png", "scale": "1x"},
+        {"size": "128x128", "idiom": "mac", "filename": "app_icon_256.png", "scale": "2x"},
+        {"size": "256x256", "idiom": "mac", "filename": "app_icon_256.png", "scale": "1x"},
+        {"size": "256x256", "idiom": "mac", "filename": "app_icon_512.png", "scale": "2x"},
+        {"size": "512x512", "idiom": "mac", "filename": "app_icon_512.png", "scale": "1x"},
+        {"size": "512x512", "idiom": "mac", "filename": "app_icon_1024.png", "scale": "2x"},
+    ], "info": {"version": 1, "author": "xcode"}}
+    with open(os.path.join(appiconset, "Contents.json"), "w") as f:
+        json.dump(contents, f, indent=2)
+    log("    · AppIcon.appiconset + Contents.json")
+
+    # tray icons (dark + light, 22x22)
+    for variant in ("dark", "light"):
+        tray = os.path.join(res_dir, f"mac-tray-{variant}-x2.png")
+        try:
+            if variant == "dark":
+                subprocess.run(["magick", icon, "-resize", "22x22",
+                                "-colorspace", "gray", "-alpha", "set",
+                                "-background", "none", "-channel", "A",
+                                "-evaluate", "set", "100%", tray],
+                               check=True, capture_output=True, timeout=30)
+            else:
+                subprocess.run(["magick", icon, "-resize", "22x22",
+                                "-negate", "-colorspace", "gray", "-alpha", "set",
+                                "-background", "none", "-channel", "A",
+                                "-evaluate", "set", "100%", tray],
+                               check=True, capture_output=True, timeout=30)
+            log(f"    · res/mac-tray-{variant}-x2.png")
+        except Exception:
+            pass
+
+
+def _apply_icon_android(src, icon, res_dir, log):
+    """Android: .ico, tray icon, mipmap icons."""
+    # res/icon.ico + tray-icon.ico
+    _make_ico(icon, os.path.join(res_dir, "icon.ico"), log)
+    shutil.copy2(os.path.join(res_dir, "icon.ico"),
+                 os.path.join(res_dir, "tray-icon.ico"))
+
+    # mipmap icons
+    res_root = os.path.join(src, "flutter", "android", "app", "src", "main", "res")
+    mipmap_sizes = {"mipmap-mdpi": 48, "mipmap-hdpi": 72,
+                    "mipmap-xhdpi": 96, "mipmap-xxhdpi": 144,
+                    "mipmap-xxxhdpi": 192}
+    for folder, sz in mipmap_sizes.items():
+        d = os.path.join(res_root, folder)
+        if os.path.isdir(d):
+            for name in ("ic_launcher.png", "ic_launcher_round.png",
+                         "ic_stat_logo.png"):
+                _magick_resize(icon, sz, os.path.join(d, name), log)
+    log("    · android mipmap icons")
+
+
+def _apply_icon_linux(src, icon, res_dir, log):
+    """Linux: same as Android (ico + resized PNGs)."""
+    _make_ico(icon, os.path.join(res_dir, "icon.ico"), log)
+    shutil.copy2(os.path.join(res_dir, "icon.ico"),
+                 os.path.join(res_dir, "tray-icon.ico"))
+
+
+def _apply_logo(src, env, platform, log):
+    """Replace the in-app logo (flutter/assets/icon.svg and logo files)."""
+    logo_file = env.get("CUSTOM_LOGO_FILE", "")
+    if not logo_file:
+        return
+    logo_abs = os.path.abspath(logo_file)
+    if not os.path.exists(logo_abs):
+        log(f"  ! logo file not found: {logo_file}")
+        return
+    log(f"  App logo -> {os.path.basename(logo_file)}")
+
+    flutter_assets = os.path.join(src, "flutter", "assets")
+
+    # If the logo is a PNG, copy as icon.png (the in-app logo displayed in about)
+    # and try to generate an SVG via potrace (macOS/Linux only — Windows
+    # workflow just uses the PNG directly, no SVG needed)
+    if logo_abs.lower().endswith(".png"):
+        shutil.copy2(logo_abs, os.path.join(flutter_assets, "icon.png"))
+        log("    · flutter/assets/icon.png (logo)")
+        if platform in ("macos", "linux"):
+            try:
+                pbm = tempfile.NamedTemporaryFile(suffix=".pbm", delete=False)
+                pbm.close()
+                subprocess.run(["magick", logo_abs, "-flatten", pbm.name],
+                               check=True, capture_output=True, timeout=30)
+                svg_path = os.path.join(flutter_assets, "icon.svg")
+                subprocess.run(["potrace", "--svg", "-o", svg_path, pbm.name],
+                               check=True, capture_output=True, timeout=30)
+                log("    · flutter/assets/icon.svg (via potrace)")
+            except Exception:
+                pass
+            finally:
+                try:
+                    os.unlink(pbm.name)
+                except OSError:
+                    pass
+    elif logo_abs.lower().endswith(".svg"):
+        shutil.copy2(logo_abs, os.path.join(flutter_assets, "icon.svg"))
+        log("    · flutter/assets/icon.svg")
+    else:
+        # copy as-is
+        shutil.copy2(logo_abs, os.path.join(flutter_assets, "icon.svg"))
+        log(f"    · flutter/assets/icon.svg (from {os.path.basename(logo_abs)})")
+
+    # Also copy to rustdesk/data/flutter_assets/assets/ if it exists
+    fa2 = os.path.join(src, "rustdesk", "data", "flutter_assets", "assets")
+    if os.path.isdir(fa2):
+        for fname in ("icon.svg", "icon.png"):
+            src_f = os.path.join(flutter_assets, fname)
+            if os.path.exists(src_f):
+                shutil.copy2(src_f, os.path.join(fa2, fname))
+
+
+# ---------------------------------------------------------------------------
 # public entry point
 # ---------------------------------------------------------------------------
 
@@ -282,10 +620,12 @@ def apply(src_dir, platform, env, patches_dir, log=print):
     _apply_allow_custom(src_dir, patches_dir, log)
     git_apply(src_dir, os.path.join(patches_dir, "removeSetupServerTip.diff"), log)
     _apply_appname(src_dir, env, platform, log)
-    _apply_company(src_dir, env, log)
+    _apply_company(src_dir, env, platform, log)
     _apply_flags(src_dir, env, patches_dir, log)
     _apply_gpu_texture_fix(src_dir, log)
     _apply_urls(src_dir, env, log)
+    _apply_icon(src_dir, env, platform, log)
+    _apply_logo(src_dir, env, platform, log)
     if platform == "android":
         _apply_android_embed(src_dir, env, log)
     log("Customizations complete.")

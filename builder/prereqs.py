@@ -268,6 +268,37 @@ def check_sccache():
     return _status(True, ver, p, note="Optional: speeds up Rust/C++ rebuilds significantly.")
 
 
+def check_imagemagick():
+    """ImageMagick — needed for icon/logo resizing and ICO/ICNS generation."""
+    for name in ("magick", "convert"):
+        p = _which(name)
+        if p:
+            ver = _run_version([name, "--version"]) or name
+            return _status(True, ver, p,
+                           note="Required for custom icon/logo branding.")
+    return _status(False, hint=_install_hint("imagemagick"))
+
+
+def check_iconutil():
+    """iconutil — macOS only, creates .icns from iconset."""
+    if _system() != "macOS":
+        return _status(False, note="macOS only.")
+    p = _which("iconutil")
+    if p:
+        return _status(True, "iconutil", p,
+                       note="Required for custom macOS .icns icon.")
+    return _status(False, hint=_install_hint("iconutil"))
+
+
+def check_potrace():
+    """potrace — optional, converts PNG logos to SVG."""
+    p = _which("potrace")
+    if p:
+        return _status(True, _run_version(["potrace", "--version"]) or "potrace",
+                       p, note="Optional: converts PNG logos to SVG for in-app display.")
+    return _status(False, hint=_install_hint("potrace"))
+
+
 CHECKS = {
     "git": check_git,
     "python": check_python,
@@ -284,6 +315,9 @@ CHECKS = {
     "rpmbuild": check_rpmbuild,
     "appimage_builder": check_appimage_builder,
     "sccache": check_sccache,
+    "imagemagick": check_imagemagick,
+    "iconutil": check_iconutil,
+    "potrace": check_potrace,
 }
 
 LABELS = {
@@ -302,6 +336,9 @@ LABELS = {
     "rpmbuild": "rpmbuild (RPM packaging)",
     "appimage_builder": "appimage-builder (AppImage packaging)",
     "sccache": "sccache (Rust/C++ compilation cache)",
+    "imagemagick": "ImageMagick (icon/logo branding)",
+    "iconutil": "iconutil (macOS .icns generation)",
+    "potrace": "potrace (PNG→SVG logo conversion)",
 }
 
 
@@ -382,6 +419,19 @@ def _install_hint(tool):
             "Windows": "cargo install sccache",
             "Linux": "cargo install sccache",
             "macOS": "cargo install sccache",
+        },
+        "imagemagick": {
+            "Windows": "Download from https://imagemagick.org/script/download.php#windows  or: choco install imagemagick",
+            "Linux": "sudo apt install imagemagick",
+            "macOS": "brew install imagemagick",
+        },
+        "iconutil": {
+            "macOS": "Comes with Xcode command-line tools: xcode-select --install",
+        },
+        "potrace": {
+            "Windows": "Download from https://potrace.sourceforge.net/#downloading",
+            "Linux": "sudo apt install potrace",
+            "macOS": "brew install potrace",
         },
     }
     return hints.get(tool, {}).get(os_name, "")
