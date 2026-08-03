@@ -359,15 +359,15 @@ def _apply_android_embed(src, env, log):
               r'bind\.mainGetLocalOption\(key:\s*"show-scam-warning"\)', '"N"', log)
 
 
-    def write_custom_txt(dest_dir, env, log=None, filename="custom_.txt"):
-        """Write the base64 payload next to the binary (category B)."""
-        os.makedirs(dest_dir, exist_ok=True)
-        path = os.path.join(dest_dir, filename)
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(env["CUSTOM_B64"])       # base64, NOT raw JSON — SKILL.md §4.1
-        if log:
-            log(f"  wrote {filename} (base64) -> {path}")
-        return path
+def write_custom_txt(dest_dir, env, log=None, filename="custom_.txt"):
+    """Write the base64 payload next to the binary (category B)."""
+    os.makedirs(dest_dir, exist_ok=True)
+    path = os.path.join(dest_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(env["CUSTOM_B64"])       # base64, NOT raw JSON — SKILL.md §4.1
+    if log:
+        log(f"  wrote {filename} (base64) -> {path}")
+    return path
 
 
 # ---------------------------------------------------------------------------
