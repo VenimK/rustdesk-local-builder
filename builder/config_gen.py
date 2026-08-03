@@ -9,6 +9,7 @@ custom_.txt and (on Android) embedded into the native code. See SKILL.md §4.1.
 
 import base64
 import json
+import os
 
 
 def _b(val):
@@ -125,10 +126,50 @@ def build_custom_env(cfg: dict) -> dict:
     env["CUSTOM_B64"] = custom_b64
     return env
 
+def config_status(path: str) -> dict:
+    """Report whether the real config exists, or we're on the example fallback.
+    Returns {"source": "config"|"example"|"missing", "path": <the path in use>,
+             "expected": <where the real config should go>,
+             "message": <human guidance, empty when source == "config">}.
+    """
+    expected = path
+    if os.path.isfile(path):
+        return {"source": "config", "path": path, "expected": expected,
+                "message": ""}
+    example = os.path.join(os.path.dirname(path), "RustDesk.example.json")
+    if os.path.isfile(example):
+        return {"source": "example", "path": example, "expected": expected,
+                "message": (
+                    "No RustDesk.json found — using RustDesk.example.json for "
+                    f"now. To build with your own server/key/password, put your "
+                    f"config file at:\n    {expected}\n"
+                    "You can generate one at https://rdgen.crayoneater.org/ or "
+                    "edit the Config tab and save.")}
+    return {"source": "missing", "path": path, "expected": expected,
+            "message": (
+                "No config file found. Create one at:\n"
+                f"    {expected}\n"
+                "Generate it at https://rdgen.crayoneater.org/ (download as "
+                "RustDesk.json), or fill in the Config tab and click Save.")}
+
 
 def load_config(path: str) -> dict:
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+        # Prefer the user's real config; fall back to the shipped example so the
+    # app still works out-of-the-box instead of throwing FileNotFoundError.
+    # If neither exists, raise a message that says exactly where to put the file.
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    example = os.path.join(os.path.dirname(path), "RustDesk.example.json")
+    if os.path.isfile(example):
+        with open(example, encoding="utf-8") as f:
+            return json.load(f)
+    raise FileNotFoundError(
+        "No RustDesk config found. Put your config at:\n"
+        f"    {path}\n"
+        "Generate one at https://rdgen.crayoneater.org/ (download as "
+        "RustDesk.json), or use the Config tab in the app and click Save. "
+        f"(A template also ships at {example}.)")
 
 
 def save_config(path: str, cfg: dict):
