@@ -250,6 +250,7 @@ function fillConfig(cfg) {
     if (el.type === "checkbox") el.checked = truthy(cfg[k]);
     else el.value = cfg[k] ?? "";
   });
+  syncColorPicker();
   restoreBrandingPreview(cfg);
   refreshPreview();
 }
@@ -282,6 +283,7 @@ async function refreshPreview() {
     `slogan : ${e.CUSTOM_SLOGAN || "(default: Powered by " + e.CUSTOM_APPNAME + ")"}\n` +
     `icon   : ${e.CUSTOM_ICON_FILE ? e.CUSTOM_ICON_FILE.split("/").pop() : "(default)"}\n` +
     `logo   : ${e.CUSTOM_LOGO_FILE ? e.CUSTOM_LOGO_FILE.split("/").pop() : "(default)"}\n` +
+    `theme  : ${e.CUSTOM_THEME_COLOR || "(default blue)"}\n` +
     `flags  : delayFix=${e.CUSTOM_DELAY_FIX} hidecm=${e.CUSTOM_HIDE_CM} ` +
     `xOffline=${e.CUSTOM_X_OFFLINE}`;
 }
@@ -508,3 +510,65 @@ $("#recheck").addEventListener("click", async () => {
 });
 
 boot();
+
+/* ── theme color picker ───────────────────────────────── */
+const cp = $("#themeColorPicker");
+const hue = $("#themeColorHue");
+const hex = $("#themeColorHex");
+const swatch = $("#themeColorSwatch");
+
+function hslToHex(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  const toHex = x => Math.round(255 * x).toString(16).padStart(2, "0");
+  return `#${toHex(f(0))}${toHex(f(8))}${toHex(f(4))}`.toUpperCase();
+}
+
+function hexToHue(hexVal) {
+  hexVal = hexVal.replace("#", "");
+  if (hexVal.length !== 6) return 212;
+  const r = parseInt(hexVal.slice(0, 2), 16) / 255;
+  const g = parseInt(hexVal.slice(2, 4), 16) / 255;
+  const b = parseInt(hexVal.slice(4, 6), 16) / 255;
+  const max = Math.max(r, g, b), min = Math.min(r, g, b);
+  if (max === min) return 0;
+  let h;
+  if (max === r) h = ((g - b) / (max - min) + (g < b ? 6 : 0)) * 60;
+  else if (max === g) h = ((b - r) / (max - min) + 2) * 60;
+  else h = ((r - g) / (max - min) + 4) * 60;
+  return Math.round(h);
+}
+
+function syncColorPicker() {
+  const v = hex.value || "#0071FF";
+  cp.value = v;
+  hue.value = hexToHue(v);
+  swatch.style.background = v;
+}
+
+cp.addEventListener("input", () => {
+  hex.value = cp.value.toUpperCase();
+  hue.value = hexToHue(cp.value);
+  swatch.style.background = cp.value;
+  refreshPreview();
+});
+
+hue.addEventListener("input", () => {
+  const v = hslToHex(+hue.value, 80, 50);
+  hex.value = v;
+  cp.value = v;
+  swatch.style.background = v;
+  refreshPreview();
+});
+
+hex.addEventListener("input", () => {
+  const v = hex.value.trim();
+  if (/^#[0-9A-Fa-f]{6}$/.test(v)) {
+    cp.value = v;
+    hue.value = hexToHue(v);
+    swatch.style.background = v;
+    refreshPreview();
+  }
+});

@@ -111,6 +111,13 @@
             <label>Company<input data-key="compname"></label>
             <label>Slogan<input data-key="slogan" placeholder="blank = Powered by {appname}"></label>
             <label>Android app id<input data-key="androidappid" placeholder="blank = default"></label>
+            <label>Theme color</label>
+            <div class="color-picker">
+              <input type="color" id="themeColorPicker" value="#0071FF">
+              <input type="range" id="themeColorHue" min="0" max="360" value="212" class="hue-slider">
+              <input data-key="themeColor" id="themeColorHex" placeholder="#0071FF" spellcheck="false">
+              <span class="color-swatch" id="themeColorSwatch"></span>
+            </div>
           </fieldset>
 
           <fieldset>
