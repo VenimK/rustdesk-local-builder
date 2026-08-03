@@ -427,7 +427,7 @@ def _apply_android_embed(src, env, log):
             shutil.rmtree(iconset, ignore_errors=True)
 
 
-    def _patch_ui_rs_icon(src, icon_path, log):
+def _patch_ui_rs_icon(src, icon_path, log):
     """Replace the base64-encoded icon PNG in src/ui.rs with the user's icon."""
     with open(icon_path, "rb") as f:
         b64 = base64.b64encode(f.read()).decode()
