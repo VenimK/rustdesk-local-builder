@@ -643,6 +643,58 @@ class Build:
                  cwd=self.src_dir, check=True, env=env)
 
     # ---- per-platform builds ---------------------------------------------
+    def _build_windows_msi(self):
+        """Build an MSI installer from the Flutter Release output.
+
+        Mirrors the VenimK/tzdm workflow:
+          1. python res/msi/preprocess.py --app-name {app} --arp -d {release_dir}
+          2. nuget restore msi.sln
+          3. msbuild msi.sln -p:Configuration=Release -p:Platform=x64
+        The MSI is collected as an artifact alongside the portable exe.
+        """
+        if self.dry_run:
+            self.log("  (would build MSI)")
+            return
+        if self.host["os"] != "Windows":
+            self.log("  · skipping MSI (requires Windows + nuget + msbuild)")
+            return
+        app_name = self.config.get("appname", "RustDesk") or "RustDesk"
+        # MSI names can't have spaces — replace with underscores
+        msi_app = app_name.replace(" ", "_")
+        release = os.path.join(self.src_dir, "flutter", "build", "windows",
+                               "x64", "runner", "Release")
+        msi_dir = os.path.join(self.src_dir, "res", "msi")
+        if not os.path.isdir(msi_dir):
+            self.log("  ! res/msi not found — skipping MSI")
+            return
+
+        self.log("  · building MSI installer…")
+        # 1. Preprocess: inject app name into MSI templates
+        self.run([self._py(), "preprocess.py", "--app-name", msi_app,
+                  "--arp", "-d", os.path.relpath(release, msi_dir)],
+                 cwd=msi_dir, check=False)
+        # 2. Restore NuGet packages
+        nuget = shutil.which("nuget", path=self._effective_path()) or "nuget"
+        self.run([nuget, "restore", "msi.sln"], cwd=msi_dir, check=False)
+        # 3. Build the MSI
+        msbuild = shutil.which("msbuild", path=self._effective_path()) or "msbuild"
+        self.run([msbuild, "msi.sln",
+                  "-p:Configuration=Release", "-p:Platform=x64",
+                  "/p:TargetVersion=Windows10"],
+                 cwd=msi_dir, check=False)
+        # 4. Collect the MSI
+        msi_src = os.path.join(msi_dir, "Package", "bin", "x64", "Release",
+                              "en-us", "Package.msi")
+        basename = self._output_basename()
+        version = self.version
+        if os.path.isfile(msi_src):
+            msi_dest = os.path.join(self.out_dir, f"{basename}-{version}.msi")
+            shutil.copy2(msi_src, msi_dest)
+            self.artifacts.append(msi_dest)
+            self.log(f"  ✓ artifact: {msi_dest}")
+        else:
+            self.log("  ! MSI not found — MSI build may have failed")
+
     def build_windows(self):
         self.log("\n=== Build Windows x86_64 ===")
         # Always use the MSVC toolchain — the official CI pins
@@ -712,18 +764,47 @@ class Build:
                 else:
                     self.log("  ! failed to download custom Flutter engine")
 
-        self.run([self._py(), "build.py", "--portable", "--hwcodec", "--flutter",
-                  "--vram", "--skip-portable-pack"], cwd=self.src_dir)
+        win_targets = [t for t in self.target_ids if t.startswith("windows-")]
+        wants_exe = "windows-x86_64-exe" in win_targets
+        wants_msi = "windows-x86_64-msi" in win_targets
+        # Default: if neither is explicitly selected, build exe (back-compat)
+        if not wants_exe and not wants_msi:
+            wants_exe = True
+
+        # build.py always runs the Flutter build. --portable triggers the
+        # self-extracting exe packing via libs/portable/generate.py.
+        # Skip portable packing when only MSI is wanted.
+        build_args = [self._py(), "build.py", "--hwcodec", "--flutter", "--vram"]
+        if wants_exe:
+            build_args.append("--portable")
+        self.run(build_args, cwd=self.src_dir)
+
         release = os.path.join(self.src_dir, "flutter", "build", "windows",
                                "x64", "runner", "Release")
         # category B: base64 custom_.txt next to the binary
         if not self.dry_run:
             env = self._env()
             customize.write_custom_txt(release, env, log=self.log)
-        # The Windows runner Release folder contains rustdesk.exe plus all the
-        # plugin DLLs it depends on (e.g. desktop_drop_plugin.dll). Copy the
-        # entire directory, not just the .exe, so the app can actually launch.
-        self._collect_dir(release, "windows", "Release")
+
+        basename = self._output_basename()
+        version = self.version
+
+        # Build and collect MSI installer if requested
+        if wants_msi:
+            self._build_windows_msi()
+
+        # Collect the portable exe if requested
+        if wants_exe:
+            portable_exe = os.path.join(self.src_dir, f"rustdesk-{version}-install.exe")
+            if os.path.isfile(portable_exe):
+                dest = os.path.join(self.out_dir, f"{basename}-{version}-install.exe")
+                shutil.copy2(portable_exe, dest)
+                self.artifacts.append(dest)
+                self.log(f"  ✓ artifact: {dest}")
+            else:
+                self.log("  ! portable exe not found — portable pack may have failed")
+            # Also copy the Release directory as a fallback (loose files)
+            self._collect_dir(release, "windows", "Release")
 
     def build_linux(self):
         self.log("\n=== Build Linux ===")

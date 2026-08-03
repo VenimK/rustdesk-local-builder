@@ -33,6 +33,7 @@ def build_custom_env(cfg: dict) -> dict:
     slogan = d.get("slogan", "") or ""
     icon_file = d.get("iconFile", "") or ""
     logo_file = d.get("logoFile", "") or ""
+    theme_color = d.get("themeColor", "") or ""
 
     env = {
         "CUSTOM_APPNAME": appname,
@@ -47,6 +48,7 @@ def build_custom_env(cfg: dict) -> dict:
         "CUSTOM_SLOGAN": slogan,
         "CUSTOM_ICON_FILE": icon_file,
         "CUSTOM_LOGO_FILE": logo_file,
+        "CUSTOM_THEME_COLOR": theme_color,
         "CUSTOM_DELAY_FIX": _b(d.get("delayFix", False)),
         "CUSTOM_HIDE_CM": _b(d.get("hidecm", False)),
         "CUSTOM_X_OFFLINE": _b(d.get("xOffline", False)),

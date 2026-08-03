@@ -268,6 +268,13 @@ def check_sccache():
     return _status(True, ver, p, note="Optional: speeds up Rust/C++ rebuilds significantly.")
 
 
+def check_nuget():
+    p = _which("nuget")
+    if not p:
+        return _status(False, hint=_install_hint("nuget"))
+    return _status(True, _run_version(["nuget", "help"]) or "nuget", p)
+
+
 def check_imagemagick():
     """ImageMagick — needed for icon/logo resizing and ICO/ICNS generation."""
     for name in ("magick", "convert"):
@@ -309,6 +316,7 @@ CHECKS = {
     "llvm": check_llvm,
     "vcpkg": check_vcpkg,
     "msbuild": check_msbuild,
+    "nuget": check_nuget,
     "java": check_java,
     "android_ndk": check_android_ndk,
     "xcode": check_xcode,
@@ -330,6 +338,7 @@ LABELS = {
     "llvm": "LLVM / libclang",
     "vcpkg": "vcpkg (native deps: ffmpeg, hwcodec)",
     "msbuild": "MSBuild (Visual Studio)",
+    "nuget": "NuGet (MSI packaging dependency)",
     "java": "Java (JDK 17)",
     "android_ndk": "Android NDK",
     "xcode": "Xcode command-line tools",
@@ -432,6 +441,11 @@ def _install_hint(tool):
             "Windows": "Download from https://potrace.sourceforge.net/#downloading",
             "Linux": "sudo apt install potrace",
             "macOS": "brew install potrace",
+        },
+        "nuget": {
+            "Windows": "Download from https://www.nuget.org/downloads  and add to PATH, or: choco install nuget.commandline",
+            "Linux": "N/A — MSI is Windows-only.",
+            "macOS": "N/A — MSI is Windows-only.",
         },
     }
     return hints.get(tool, {}).get(os_name, "")
