@@ -370,61 +370,61 @@ def _apply_android_embed(src, env, log):
         return path
 
 
-    # ---------------------------------------------------------------------------
-    # icon / logo branding (all platforms)
-    # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# icon / logo branding (all platforms)
+# ---------------------------------------------------------------------------
 
-    def _magick_resize(src_img, size, dst_img, log=None):
-        """Resize an image using ImageMagick (tries `magick` v7 then `convert` v6)."""
-        for cmd in ("magick", "convert"):
-            try:
-                subprocess.run([cmd, src_img, "-resize", f"{size}x{size}", dst_img],
-                            check=True, capture_output=True, timeout=30)
-                return True
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                continue
-        if log:
-            log(f"    ! ImageMagick not found — cannot resize to {size}x{size}")
-        return False
-
-
-    def _make_ico(src_img, dst_ico, log=None):
-        """Create a multi-resolution ICO (256,64,48,32,16) from a PNG via ImageMagick."""
-        for cmd in ("magick", "convert"):
-            try:
-                subprocess.run([cmd, src_img, "-define",
-                                "icon:auto-resize=256,64,48,32,16", dst_ico],
-                            check=True, capture_output=True, timeout=30)
-                return True
-            except (FileNotFoundError, subprocess.CalledProcessError):
-                continue
-        if log:
-            log("    ! ImageMagick not found — cannot create .ico")
-        return False
-
-
-    def _make_icns(src_img, dst_icns, log=None):
-        """Create an .icns from a PNG using iconutil (macOS only)."""
-        iconset = tempfile.mkdtemp(suffix=".iconset")
-        sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
-                (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
-                (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
-                (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
-                (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")]
-        for sz, name in sizes:
-            _magick_resize(src_img, sz, os.path.join(iconset, name), log)
+def _magick_resize(src_img, size, dst_img, log=None):
+    """Resize an image using ImageMagick (tries `magick` v7 then `convert` v6)."""
+    for cmd in ("magick", "convert"):
         try:
-            subprocess.run(["iconutil", "-c", "icns", iconset, "-o", dst_icns],
-                        check=True, capture_output=True, timeout=30)
-            if log:
-                log(f"    · created {os.path.basename(dst_icns)} via iconutil")
+            subprocess.run([cmd, src_img, "-resize", f"{size}x{size}", dst_img],
+                           check=True, capture_output=True, timeout=30)
             return True
-        except Exception:
-            if log:
-                log("    ! iconutil failed — cannot create .icns")
-            return False
-        finally:
-            shutil.rmtree(iconset, ignore_errors=True)
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    if log:
+        log(f"    ! ImageMagick not found — cannot resize to {size}x{size}")
+    return False
+
+
+def _make_ico(src_img, dst_ico, log=None):
+    """Create a multi-resolution ICO (256,64,48,32,16) from a PNG via ImageMagick."""
+    for cmd in ("magick", "convert"):
+        try:
+            subprocess.run([cmd, src_img, "-define",
+                            "icon:auto-resize=256,64,48,32,16", dst_ico],
+                           check=True, capture_output=True, timeout=30)
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            continue
+    if log:
+        log("    ! ImageMagick not found — cannot create .ico")
+    return False
+
+
+def _make_icns(src_img, dst_icns, log=None):
+    """Create an .icns from a PNG using iconutil (macOS only)."""
+    iconset = tempfile.mkdtemp(suffix=".iconset")
+    sizes = [(16, "icon_16x16.png"), (32, "icon_16x16@2x.png"),
+             (32, "icon_32x32.png"), (64, "icon_32x32@2x.png"),
+             (128, "icon_128x128.png"), (256, "icon_128x128@2x.png"),
+             (256, "icon_256x256.png"), (512, "icon_256x256@2x.png"),
+             (512, "icon_512x512.png"), (1024, "icon_512x512@2x.png")]
+    for sz, name in sizes:
+        _magick_resize(src_img, sz, os.path.join(iconset, name), log)
+    try:
+        subprocess.run(["iconutil", "-c", "icns", iconset, "-o", dst_icns],
+                       check=True, capture_output=True, timeout=30)
+        if log:
+            log(f"    · created {os.path.basename(dst_icns)} via iconutil")
+        return True
+    except Exception:
+        if log:
+            log("    ! iconutil failed — cannot create .icns")
+        return False
+    finally:
+        shutil.rmtree(iconset, ignore_errors=True)
 
 
 def _patch_ui_rs_icon(src, icon_path, log):
