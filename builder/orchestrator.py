@@ -771,17 +771,19 @@ class Build:
         if not wants_exe and not wants_msi:
             wants_exe = True
 
-        # build.py always runs the Flutter build. --portable triggers the
-        # self-extracting exe packing via libs/portable/generate.py.
-        # Skip portable packing when only MSI is wanted.
-        build_args = [self._py(), "build.py", "--hwcodec", "--flutter", "--vram"]
-        if wants_exe:
-            build_args.append("--portable")
+        # build.py always runs the Flutter build. Pass --skip-portable-pack
+        # so build.py does NOT pack the portable exe itself — packing must
+        # happen AFTER we write custom_.txt into `release` below, otherwise
+        # the packed exe is built from a Release folder that doesn't have
+        # custom_.txt yet and ships with no baked-in branding/password/perms.
+        build_args = [self._py(), "build.py", "--hwcodec", "--flutter", "--vram",
+                      "--skip-portable-pack"]
         self.run(build_args, cwd=self.src_dir)
 
         release = os.path.join(self.src_dir, "flutter", "build", "windows",
                                "x64", "runner", "Release")
-        # category B: base64 custom_.txt next to the binary
+        # category B: base64 custom_.txt next to the binary — must land in
+        # `release` BEFORE the portable packer runs (see comment above).
         if not self.dry_run:
             env = self._env()
             customize.write_custom_txt(release, env, log=self.log)
@@ -793,8 +795,9 @@ class Build:
         if wants_msi:
             self._build_windows_msi()
 
-        # Collect the portable exe if requested
+        # Pack + collect the portable exe if requested
         if wants_exe:
+            self._pack_windows_portable(release, version)
             portable_exe = os.path.join(self.src_dir, f"rustdesk-{version}-install.exe")
             if os.path.isfile(portable_exe):
                 dest = os.path.join(self.out_dir, f"{basename}-{version}-install.exe")
@@ -805,6 +808,33 @@ class Build:
                 self.log("  ! portable exe not found — portable pack may have failed")
             # Also copy the Release directory as a fallback (loose files)
             self._collect_dir(release, "windows", "Release")
+
+    def _pack_windows_portable(self, release, version):
+        """Run libs/portable/generate.py ourselves (mirrors build.py's own
+        build_flutter_windows packing step), now that `release` already has
+        custom_.txt written into it — so the packed exe bakes in branding,
+        password, and permissions correctly."""
+        self.log("\n=== Pack Windows portable (single .exe) ===")
+        exe_name = os.path.join(release, "rustdesk.exe")
+        if not os.path.isfile(exe_name):
+            # rename may already have happened in some flows
+            for cand in os.listdir(release) if os.path.isdir(release) else []:
+                if cand.lower().endswith(".exe"):
+                    exe_name = os.path.join(release, cand)
+                    break
+        portable_dir = os.path.join(self.src_dir, "libs", "portable")
+        self.run([self._py(), "-m", "pip", "install", "-r", "requirements.txt"],
+                 cwd=portable_dir, check=False)
+        self.run([self._py(), "generate.py", "-f", release, "-o", ".",
+                  "-e", exe_name], cwd=portable_dir)
+        packer_exe = os.path.join(self.src_dir, "target", "release",
+                                  "rustdesk-portable-packer.exe")
+        dest = os.path.join(self.src_dir, f"rustdesk-{version}-install.exe")
+        if os.path.isfile(packer_exe):
+            shutil.move(packer_exe, dest)
+            self.log(f"  ✓ packed portable exe -> {dest}")
+        else:
+            self.log(f"  ! packer did not produce {packer_exe}")
 
     def build_linux(self):
         self.log("\n=== Build Linux ===")
