@@ -1219,6 +1219,10 @@ class Build:
     def build_macos(self):
         self.log("\n=== Build macOS ===")
         self.customize_for("macos")
+        # Install native vcpkg deps (opus, libyuv, libvpx, ffmpeg) for macOS
+        # before cargo runs, otherwise magnum-opus/scrap/hwcodec fail on
+        # missing headers and libraries.
+        self.setup_vcpkg("arm64-osx")
         # Official CI pins Rust 1.81 for macOS (1.75 is for Windows/Linux).
         # M1 builds fail with 1.78+ i128 ABI changes, and 1.81 is the macOS pin.
         # Toolchain host triple must match this machine; cross targets are separate.
@@ -1234,6 +1238,7 @@ class Build:
         self.run(["rustup", "default", toolchain], check=False)
         self._patch_macos_podfile()
         self._patch_macos_build_py()
+        self._patch_macos_generated_bridge()
         self.run([self._py(), "build.py", "--flutter", "--hwcodec"],
                  cwd=self.src_dir, check=False)
         env = self._env()
@@ -1375,6 +1380,45 @@ class Build:
         with open(build_py, "w", encoding="utf-8", errors="surrogateescape") as f:
             f.write(text)
         self.log(f"  · patched build.py: RustDesk.app -> {app_name}.app")
+
+    def _patch_macos_generated_bridge(self):
+        """Fix ffigen-generated Dart bindings that fail on macOS builds.
+
+        Two issues:
+        1. wire_uint_8_list.ptr is typed as ffi.Pointer<ffi.Int> but the C
+           header declares uint8_t *ptr. asTypedList() only exists on
+           Pointer<Uint8>, not Pointer<Int>, causing a compile error.
+        2. ffi_bindgen_function_refactor() (the sed fix for Bool->Uint8 in
+           the DartPostCObjectFnType signature) is only called in
+           build_flutter_deb and build_flutter_arch_manjaro, never for macOS.
+        """
+        if self.dry_run:
+            return
+        dart_file = os.path.join(self.src_dir, "flutter", "lib",
+                                 "generated_bridge.dart")
+        if not os.path.isfile(dart_file):
+            return
+        with open(dart_file, "r", encoding="utf-8") as f:
+            text = f.read()
+        changed = False
+        # Fix 1: wire_uint_8_list ptr type Int -> Uint8
+        if "external ffi.Pointer<ffi.Int> ptr;" in text:
+            text = text.replace(
+                "external ffi.Pointer<ffi.Int> ptr;",
+                "external ffi.Pointer<ffi.Uint8> ptr;",
+                1)
+            changed = True
+        # Fix 2: Bool Function(DartPort -> Uint8 Function(DartPort
+        # (same sed as ffi_bindgen_function_refactor in build.py)
+        if "ffi.NativeFunction<ffi.Bool Function(DartPort" in text:
+            text = text.replace(
+                "ffi.NativeFunction<ffi.Bool Function(DartPort",
+                "ffi.NativeFunction<ffi.Uint8 Function(DartPort")
+            changed = True
+        if changed:
+            with open(dart_file, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.log("  · patched generated_bridge.dart: ptr type + Bool->Uint8")
 
     def _create_macos_dmg(self):
         """Create a .dmg from the built RustDesk.app using create-dmg.
