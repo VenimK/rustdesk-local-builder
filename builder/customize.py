@@ -301,6 +301,12 @@ def _apply_urls(src, env, log):
                     "flutter/lib/desktop/pages/desktop_setting_page.dart",
                     "flutter/lib/mobile/pages/settings_page.dart"]:
             sed(src, rel, "https://rustdesk.com", url)
+        # Replace the bare "rustdesk.com" label shown in the mobile About
+        # section (the actual link above is already replaced).
+        url_host = url.replace("https://", "").replace("http://", "").strip("/").split("/")[0]
+        if url_host:
+            sed(src, "flutter/lib/mobile/pages/settings_page.dart",
+                "'rustdesk.com'", f"'{url_host}'")
     if dl and dl != "https://rustdesk.com/download":
         for rel in ["flutter/lib/desktop/pages/desktop_home_page.dart",
                     "flutter/lib/mobile/pages/connection_page.dart"]:
@@ -576,6 +582,12 @@ def _apply_icon_android(src, icon, res_dir, log):
             for name in ("ic_launcher.png", "ic_launcher_round.png",
                          "ic_stat_logo.png"):
                 _magick_resize(icon, sz, os.path.join(d, name), log)
+    # Remove the adaptive-icon XML folder, otherwise launchers on Android 8+
+    # still use the default RustDesk vector icon instead of our PNG mipmaps.
+    anydpi = os.path.join(res_root, "mipmap-anydpi-v26")
+    if os.path.isdir(anydpi):
+        shutil.rmtree(anydpi)
+        log("    · removed default mipmap-anydpi-v26 adaptive icons")
     log("    · android mipmap icons")
 
 
