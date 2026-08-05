@@ -24,7 +24,7 @@ import time
 import zipfile
 import platform as _platform
 
-from . import customize, detect
+from . import customize, detect, prereqs
 
 RUSTDESK_REPO = "https://github.com/rustdesk/rustdesk.git"
 
@@ -189,9 +189,44 @@ class Build:
                 # a leftover read-only .git on Windows can resist removal
                 if os.path.exists(self.src_dir):
                     _force_rmtree(self.src_dir)
+                # last resort: shell rm -rf can clear files Python cannot
+                if os.path.exists(self.src_dir):
+                    self.log(f"  force-removing leftover {self.src_dir}")
+                    if self.host["os"] == "Windows":
+                        subprocess.run(
+                            ["cmd", "/c", f'rmdir /s /q "{self.src_dir}"'],
+                            check=False)
+                    else:
+                        subprocess.run(["rm", "-rf", self.src_dir],
+                                       check=False)
+                # NFS volumes (e.g. /Volumes on macOS) create .nfs* "silly
+                # rename" files when a deleted file is still open.  These
+                # vanish once the process exits, so retry once after a brief
+                # wait.  If the dir *still* won't go, clone into a sibling
+                # temp dir and rename — git clone just needs an empty target.
+                if os.path.exists(self.src_dir):
+                    import time
+                    time.sleep(2)
+                    subprocess.run(["rm", "-rf", self.src_dir], check=False)
         os.makedirs(self.workspace, exist_ok=True)
-        self.run(["git", "clone", "--depth", "1", "--branch", self.version,
-                  "--recurse-submodules", RUSTDESK_REPO, self.src_dir])
+        if os.path.exists(self.src_dir):
+            # Could not remove the old tree (NFS stale handles, locked files).
+            # Clone into a fresh temp name, then swap.
+            tmp_dir = self.src_dir + ".checkout-tmp"
+            if os.path.exists(tmp_dir):
+                subprocess.run(["rm", "-rf", tmp_dir], check=False)
+            self.run(["git", "clone", "--depth", "1", "--branch", self.version,
+                      "--recurse-submodules", RUSTDESK_REPO, tmp_dir])
+            # Best-effort: try removing the old dir again, then rename.
+            subprocess.run(["rm", "-rf", self.src_dir], check=False)
+            if os.path.exists(self.src_dir):
+                # Still stuck — just use the temp dir as src_dir
+                self.src_dir = tmp_dir
+            else:
+                os.rename(tmp_dir, self.src_dir)
+        else:
+            self.run(["git", "clone", "--depth", "1", "--branch", self.version,
+                      "--recurse-submodules", RUSTDESK_REPO, self.src_dir])
 
     def _project_root(self):
         return os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -643,21 +678,83 @@ class Build:
                  cwd=self.src_dir, check=True, env=env)
 
     # ---- per-platform builds ---------------------------------------------
+    def _find_msbuild(self):
+        """Locate MSBuild.exe — PATH first, then vswhere (same idea as prereqs)."""
+        for name in ("msbuild", "MSBuild"):
+            p = shutil.which(name, path=self._effective_path())
+            if p:
+                return p
+        pf = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        vswhere = os.path.join(pf, "Microsoft Visual Studio", "Installer",
+                               "vswhere.exe")
+        if not os.path.isfile(vswhere):
+            return None
+        try:
+            out = subprocess.check_output(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.Component.MSBuild",
+                 "-find", r"MSBuild\**\Bin\MSBuild.exe"],
+                encoding="utf-8", errors="replace", timeout=20).strip()
+            if out:
+                return out.splitlines()[0].strip()
+        except Exception:
+            pass
+        try:
+            out = subprocess.check_output(
+                [vswhere, "-latest", "-products", "*",
+                 "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                 "-property", "installationPath"],
+                encoding="utf-8", errors="replace", timeout=20).strip()
+            if out:
+                for root, _dirs, files in os.walk(os.path.join(out, "MSBuild")):
+                    if "MSBuild.exe" in files:
+                        return os.path.join(root, "MSBuild.exe")
+        except Exception:
+            pass
+        return None
+
+    def _prepare_msi_release_exe(self, release, msi_app):
+        """Ensure Release/{app}.exe exists for preprocess.py.
+
+        Flutter/CMake often still emit rustdesk.exe even when branding is set.
+        preprocess.py runs `{app}.exe --version` / `--build-date` and packages
+        under that name, so copy (don't rename) rustdesk.exe when needed so the
+        portable packer can still find rustdesk.exe afterwards.
+        """
+        branded = os.path.join(release, f"{msi_app}.exe")
+        if os.path.isfile(branded):
+            return branded
+        rustdesk = os.path.join(release, "rustdesk.exe")
+        if os.path.isfile(rustdesk):
+            shutil.copy2(rustdesk, branded)
+            self.log(f"  · copied rustdesk.exe -> {msi_app}.exe for MSI")
+            return branded
+        # last resort: any .exe in Release
+        if os.path.isdir(release):
+            for name in os.listdir(release):
+                if name.lower().endswith(".exe"):
+                    src = os.path.join(release, name)
+                    shutil.copy2(src, branded)
+                    self.log(f"  · copied {name} -> {msi_app}.exe for MSI")
+                    return branded
+        raise RuntimeError(
+            f"no .exe found in {release} to prepare {msi_app}.exe for MSI")
+
     def _build_windows_msi(self):
         """Build an MSI installer from the Flutter Release output.
 
-        Mirrors the VenimK/tzdm workflow:
-          1. python res/msi/preprocess.py --app-name {app} --arp -d {release_dir}
-          2. nuget restore msi.sln
-          3. msbuild msi.sln -p:Configuration=Release -p:Platform=x64
-        The MSI is collected as an artifact alongside the portable exe.
+        Mirrors the VenimK/tzdm / official workflow:
+          1. ensure branded .exe exists in Release
+          2. python res/msi/preprocess.py --app-name {app} --version {ver} --arp -d {release}
+          3. nuget restore (CustomActions packages.config) + dotnet restore (WiX SDK)
+          4. msbuild msi.sln -p:Configuration=Release -p:Platform=x64
+        Failures raise — MSI was explicitly requested.
         """
         if self.dry_run:
             self.log("  (would build MSI)")
             return
         if self.host["os"] != "Windows":
-            self.log("  · skipping MSI (requires Windows + nuget + msbuild)")
-            return
+            raise RuntimeError("MSI build requires Windows + nuget + msbuild")
         app_name = self.config.get("appname", "RustDesk") or "RustDesk"
         # MSI names can't have spaces — replace with underscores
         msi_app = app_name.replace(" ", "_")
@@ -665,35 +762,120 @@ class Build:
                                "x64", "runner", "Release")
         msi_dir = os.path.join(self.src_dir, "res", "msi")
         if not os.path.isdir(msi_dir):
-            self.log("  ! res/msi not found — skipping MSI")
-            return
+            raise RuntimeError(f"res/msi not found at {msi_dir}")
+        if not os.path.isdir(release):
+            raise RuntimeError(f"Flutter Release dir not found: {release}")
 
         self.log("  · building MSI installer…")
-        # 1. Preprocess: inject app name into MSI templates
-        self.run([self._py(), "preprocess.py", "--app-name", msi_app,
-                  "--arp", "-d", os.path.relpath(release, msi_dir)],
-                 cwd=msi_dir, check=False)
-        # 2. Restore NuGet packages
+        self._prepare_msi_release_exe(release, msi_app)
+
+        # 1. Preprocess: inject app name + version into MSI templates.
+        # Pass --version so we don't rely solely on running the exe (still need
+        # --build-date from the binary, which is why the branded exe must exist).
+        dist_arg = os.path.relpath(release, msi_dir)
+        rc = self.run(
+            [self._py(), "preprocess.py",
+             "--app-name", msi_app,
+             "--version", self.version,
+             "--arp",
+             "-d", dist_arg],
+            cwd=msi_dir, check=False)
+        if rc != 0:
+            raise RuntimeError(
+                f"MSI preprocess.py failed (exit {rc}). "
+                f"Check that {msi_app}.exe exists under Release and responds "
+                f"to --version / --build-date.")
+
+        # 2. Ensure nuget.org is registered (Chocolatey nuget often ships with
+        # zero sources — restore then fails with "Unable to find version …").
         nuget = shutil.which("nuget", path=self._effective_path()) or "nuget"
-        self.run([nuget, "restore", "msi.sln"], cwd=msi_dir, check=False)
+        prereqs.ensure_nuget_org(nuget, log=self.log)
+
+        # 2a. Restore packages.config (CustomActions) into res/msi/packages
+        ca = os.path.join(msi_dir, "CustomActions")
+        if os.path.isfile(os.path.join(ca, "packages.config")):
+            rc = self.run([nuget, "restore", "packages.config",
+                           "-PackagesDirectory",
+                           os.path.join(msi_dir, "packages")],
+                          cwd=ca, check=False)
+            if rc != 0:
+                raise RuntimeError(
+                    f"nuget restore of CustomActions packages failed (exit {rc}). "
+                    f"Is nuget.org reachable?")
+
+        # 2b. Restore the solution (WiX PackageReference + any remaining)
+        rc = self.run([nuget, "restore", "msi.sln",
+                       "-PackagesDirectory", "packages"],
+                      cwd=msi_dir, check=False)
+        if rc != 0:
+            self.log(f"  · nuget restore msi.sln exit {rc} "
+                     f"(may be OK if packages.config already restored)")
+
+        # 2c. Restore WiX SDK-style Package project (needs .NET SDK / dotnet)
+        pkg_proj = os.path.join(msi_dir, "Package", "Package.wixproj")
+        # Prefer a fresh PATH so a just-installed .NET SDK is visible even if
+        # this process started before the install.
+        path_now = os.environ.get("PATH", "")
+        for extra in (
+            r"C:\Program Files\dotnet",
+            os.path.expandvars(r"%ProgramFiles%\dotnet"),
+        ):
+            if extra and os.path.isdir(extra) and extra not in path_now:
+                path_now = extra + os.pathsep + path_now
+                os.environ["PATH"] = path_now
+        dotnet = (shutil.which("dotnet", path=self._effective_path())
+                  or shutil.which("dotnet"))
+        if dotnet and os.path.isfile(pkg_proj):
+            rc = self.run([dotnet, "restore", pkg_proj], cwd=msi_dir, check=False)
+            if rc != 0:
+                raise RuntimeError(
+                    f"dotnet restore of Package.wixproj failed (exit {rc}). "
+                    f"Need .NET 8+ SDK and nuget.org for WixToolset.Sdk 4.0.5.")
+        elif not dotnet:
+            raise RuntimeError(
+                "dotnet not found — WiX Toolset SDK 4.x (Package.wixproj) "
+                "requires the .NET SDK. Install .NET 8 SDK, re-open the app, "
+                "and re-run the MSI build.")
+
         # 3. Build the MSI
-        msbuild = shutil.which("msbuild", path=self._effective_path()) or "msbuild"
-        self.run([msbuild, "msi.sln",
-                  "-p:Configuration=Release", "-p:Platform=x64",
-                  "/p:TargetVersion=Windows10"],
-                 cwd=msi_dir, check=False)
+        msbuild = self._find_msbuild()
+        if not msbuild:
+            raise RuntimeError(
+                "MSBuild not found. Install VS Build Tools (Desktop C++ / MSBuild) "
+                "or add MSBuild to PATH. Prereqs use vswhere; this step does too.")
+        self.log(f"  · MSBuild: {msbuild}")
+        rc = self.run([msbuild, "msi.sln",
+                       "-p:Configuration=Release", "-p:Platform=x64",
+                       "/p:TargetVersion=Windows10",
+                       "/m"],
+                      cwd=msi_dir, check=False)
+        if rc != 0:
+            raise RuntimeError(
+                f"MSI msbuild failed (exit {rc}). Common causes: missing "
+                f"WixToolset.Sdk 4.0.5 (install .NET SDK + `dotnet restore`), "
+                f"or missing WixToolset.DUtil/WcaUtil under res/msi/packages.")
+
         # 4. Collect the MSI
         msi_src = os.path.join(msi_dir, "Package", "bin", "x64", "Release",
-                              "en-us", "Package.msi")
+                               "en-us", "Package.msi")
+        if not os.path.isfile(msi_src):
+            # WiX sometimes drops the MSI one level up
+            alt = os.path.join(msi_dir, "Package", "bin", "x64", "Release",
+                               "Package.msi")
+            if os.path.isfile(alt):
+                msi_src = alt
         basename = self._output_basename()
         version = self.version
         if os.path.isfile(msi_src):
+            os.makedirs(self.out_dir, exist_ok=True)
             msi_dest = os.path.join(self.out_dir, f"{basename}-{version}.msi")
             shutil.copy2(msi_src, msi_dest)
             self.artifacts.append(msi_dest)
             self.log(f"  ✓ artifact: {msi_dest}")
         else:
-            self.log("  ! MSI not found — MSI build may have failed")
+            raise RuntimeError(
+                f"MSI not found after build (expected {msi_src}). "
+                f"See msbuild output above.")
 
     def build_windows(self):
         self.log("\n=== Build Windows x86_64 ===")

@@ -172,7 +172,7 @@ TARGETS = [
     {"id": "windows-x86_64-msi", "platform": "windows", "arch": "x86_64",
      "label": "Windows 64-bit — installer .msi", "ext": "msi",
      "host_os": ["Windows"],
-     "note": "MSI installer. Needs Visual Studio MSBuild + WiX/nuget."},
+     "note": "MSI installer. Needs MSBuild, NuGet (nuget.org), and .NET 8+ SDK (WiX 4)."},
 
     # ---- Linux (Flutter) -> Linux host only ----
     {"id": "linux-x86_64-deb", "platform": "linux", "arch": "x86_64",
@@ -267,7 +267,9 @@ def required_tools(target, host_os_name):
     if p == "windows":
         tools = common + ["flutter", "llvm", "vcpkg"]
         if target["ext"] == "msi":
-            tools += ["msbuild"]
+            # MSI packaging: VS MSBuild builds msi.sln; nuget restores
+            # CustomActions packages; dotnet resolves WixToolset.Sdk 4.x.
+            tools += ["msbuild", "nuget", "dotnet"]
         return tools
     if p == "linux":
         tools = common + ["flutter", "clang", "vcpkg"]

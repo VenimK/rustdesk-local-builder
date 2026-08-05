@@ -495,19 +495,28 @@ def _apply_icon(src, env, platform, log):
 
 
 def _apply_icon_windows(src, icon, res_dir, log):
-    """Windows: .ico, tray icon, Runner.rc resource."""
+    """Windows: .ico, tray icon, Runner.rc resource, flutter_assets icon.ico."""
     # res/icon.ico
-    _make_ico(icon, os.path.join(res_dir, "icon.ico"), log)
+    ico_path = os.path.join(res_dir, "icon.ico")
+    _make_ico(icon, ico_path, log)
     # res/tray-icon.ico
-    shutil.copy2(os.path.join(res_dir, "icon.ico"),
-                 os.path.join(res_dir, "tray-icon.ico"))
+    shutil.copy2(ico_path, os.path.join(res_dir, "tray-icon.ico"))
     log("    · res/tray-icon.ico")
-    # flutter/windows/runner/resources/app_icon.ico
+    # flutter/windows/runner/resources/app_icon.ico (compiled into exe)
     runner_ico = os.path.join(src, "flutter", "windows", "runner",
                               "resources", "app_icon.ico")
     if os.path.exists(runner_ico):
-        shutil.copy2(os.path.join(res_dir, "icon.ico"), runner_ico)
+        shutil.copy2(ico_path, runner_ico)
         log("    · flutter/windows/runner/resources/app_icon.ico")
+    # flutter/assets/icon.ico — loaded at runtime by win32_window.cpp
+    # LoadCustomIcon() from data\flutter_assets\assets\icon.ico
+    flutter_assets = os.path.join(src, "flutter", "assets")
+    shutil.copy2(ico_path, os.path.join(flutter_assets, "icon.ico"))
+    log("    · flutter/assets/icon.ico (runtime window icon)")
+    # rustdesk/data/flutter_assets/assets/icon.ico (if exists)
+    fa2 = os.path.join(src, "rustdesk", "data", "flutter_assets", "assets")
+    if os.path.isdir(fa2):
+        shutil.copy2(ico_path, os.path.join(fa2, "icon.ico"))
 
 
 def _apply_icon_macos(src, icon, res_dir, log):
@@ -612,8 +621,8 @@ def _apply_logo(src, env, platform, log):
     flutter_assets = os.path.join(src, "flutter", "assets")
 
     # If the logo is a PNG, copy as icon.png (the in-app logo displayed in about)
-    # and try to generate an SVG via potrace (macOS/Linux only — Windows
-    # workflow just uses the PNG directly, no SVG needed)
+    # and try to generate an SVG via potrace (macOS/Linux only; on Windows
+    # potrace is often unavailable, so the PNG fallback in loadIcon() is used).
     if logo_abs.lower().endswith(".png"):
         shutil.copy2(logo_abs, os.path.join(flutter_assets, "icon.png"))
         log("    · flutter/assets/icon.png (logo)")

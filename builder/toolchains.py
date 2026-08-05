@@ -9,8 +9,9 @@ detection immediately sees the freshly-installed tools.
 What can be auto-installed (portable, deterministic):
     flutter · llvm · vcpkg · android_ndk · java · rust(add 1.75 via rustup)
 
-What can't (needs a real system installer / elevation) stays a guided hint:
-    msbuild / the Visual Studio C++ workload, Xcode.
+What can't (needs a real system installer / elevation) stays a guided hint
+or a package-manager install:
+    msbuild / VS Build Tools · nuget · .NET SDK · Xcode
 
 NOTE: the download URLs are the official ones but versions/paths do drift —
 if a download 404s, update the registry below. Everything writes under
@@ -43,6 +44,8 @@ SIZE_HINTS = {
     "vcpkg":       {"download": "~10 MB",  "disk": "~600 MB", "version": "pinned"},
     "rust":        {"download": "~250 MB", "disk": "~800 MB", "version": "1.75"},
     "vs_buildtools": {"download": "~4 MB", "disk": "~4-6 GB", "version": "2022 (C++)"},
+    "nuget":       {"download": "~5 MB",   "disk": "~20 MB",  "version": "CLI"},
+    "dotnet":      {"download": "~200 MB", "disk": "~500 MB", "version": "8.0 SDK"},
     "sccache":     {"download": "~30 MB",  "disk": "~100 MB", "version": "0.11.0"},
     "imagemagick": {"download": "~60 MB",  "disk": "~200 MB", "version": "7.x"},
     "potrace":     {"download": "~1 MB",   "disk": "~5 MB",   "version": "1.16"},
@@ -158,6 +161,31 @@ TOOLS = {
             ("Windows", "x86_64"): ("https://aka.ms/vs/17/release/vs_BuildTools.exe", "vs"),
         },
     },
+    # NuGet CLI + nuget.org feed — restore WiX CustomActions packages for MSI.
+    # Chocolatey nuget often ships with zero package sources; install step
+    # always re-registers nuget.org.
+    "nuget": {
+        "label": "NuGet CLI (MSI / WiX packages)",
+        "kind": "nuget",
+        "marker": "nuget",
+        "packages": {
+            "Windows": ("choco", ["install", "-y", "nuget.commandline"]),
+        },
+    },
+    # .NET 8 SDK — required to resolve WixToolset.Sdk for WiX 4 Package.wixproj.
+    "dotnet": {
+        "label": ".NET 8 SDK (WiX Toolset / MSI)",
+        "kind": "package",
+        "marker": "dotnet",
+        "packages": {
+            "Windows": ("winget", [
+                "install", "--id", "Microsoft.DotNet.SDK.8", "-e",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+                "--disable-interactivity",
+            ]),
+        },
+    },
     # sccache — shared compilation cache for Rust/C/C++. Installed via cargo,
     # works on all platforms. Set RUSTC_WRAPPER=sccache to speed up rebuilds.
     "sccache": {
@@ -193,7 +221,8 @@ TOOLS = {
 # which detection id each tool satisfies (prereqs.py ids)
 SATISFIES = {"flutter": "flutter", "llvm": "llvm", "android_ndk": "android_ndk",
              "java": "java", "vcpkg": "vcpkg", "rust": "rust",
-             "vs_buildtools": "msbuild", "sccache": "sccache",
+             "vs_buildtools": "msbuild", "nuget": "nuget", "dotnet": "dotnet",
+             "sccache": "sccache",
              "imagemagick": "imagemagick", "potrace": "potrace"}
 
 
@@ -277,6 +306,21 @@ def installable(host_os=None, host_arch=None):
         elif spec["kind"] == "vs":
             if host_os != "Windows":
                 ok, reason = False, "Visual Studio Build Tools are Windows-only"
+        elif spec["kind"] == "nuget":
+            if host_os != "Windows":
+                ok, reason = False, "NuGet CLI is only needed for Windows MSI builds"
+            else:
+                pkgs = spec.get("packages", {})
+                if host_os in pkgs:
+                    mgr = pkgs[host_os][0]
+                    # Installable if the package manager is present OR nuget is
+                    # already on PATH (we only need to fix the nuget.org source).
+                    if not shutil.which(mgr) and not shutil.which(
+                            spec.get("marker", "nuget")):
+                        ok, reason = (
+                            False,
+                            f"{mgr} not found — install NuGet manually: "
+                            "https://www.nuget.org/downloads")
         elif spec["kind"] == "cargo":
             if not shutil.which("cargo"):
                 ok, reason = False, "Rust/cargo is required to install this"
@@ -453,22 +497,90 @@ def install_one(tid, root, log, cancelled=lambda: False):
         return {"tool": tid, "home": cargo_bin, "env": env}
 
     if spec["kind"] == "package":
-        # System package manager install (brew/apt/choco).
+        # System package manager install (brew/apt/choco/winget).
         # The tool lands in the system PATH, not .toolchains — no env wiring needed.
         host_os = _system()
         mgr, args = spec["packages"][host_os]
-        if shutil.which(spec.get("marker", tid)):
-            log(f"  ✓ {tid} already installed")
+        marker = spec.get("marker", tid)
+        already = shutil.which(marker)
+        # .NET may live under Program Files before PATH is refreshed
+        if not already and tid == "dotnet" and WIN:
+            for cand in (
+                os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                             "dotnet", "dotnet.exe"),
+                r"C:\Program Files\dotnet\dotnet.exe",
+            ):
+                if os.path.isfile(cand):
+                    already = cand
+                    break
+        if already:
+            log(f"  ✓ {tid} already installed ({already})")
         else:
             log(f"  running: {mgr} {' '.join(args)}")
             rc = subprocess.call([mgr] + args)
-            if rc != 0:
-                raise RuntimeError(f"{mgr} install failed for {tid}")
-        # verify the binary is now on PATH
-        if shutil.which(spec.get("marker", tid)):
-            log(f"  ✓ {tid} installed via {mgr}")
+            # winget returns 0 on success; -1978335189 (0x8A15000B) means
+            # "already installed" on some versions — treat as success.
+            if rc != 0 and not (mgr == "winget" and rc in (-1978335189, -1978335212)):
+                raise RuntimeError(f"{mgr} install failed for {tid} (exit {rc})")
+        # Refresh PATH for this process so verification sees new installs
+        if WIN:
+            machine = os.environ.get("Path", os.environ.get("PATH", ""))
+            # Pull Machine+User PATH via a lightweight PowerShell call is heavy;
+            # just prepend the well-known dotnet location.
+            pf_dotnet = os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"), "dotnet")
+            if os.path.isdir(pf_dotnet) and pf_dotnet not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = pf_dotnet + os.pathsep + os.environ.get("PATH", "")
+        found = shutil.which(marker)
+        if not found and tid == "dotnet" and WIN:
+            cand = os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "dotnet", "dotnet.exe")
+            if os.path.isfile(cand):
+                found = cand
+        if found:
+            log(f"  ✓ {tid} installed via {mgr}" if not already
+                else f"  ✓ {tid} ready")
         else:
-            log(f"  ! {tid} install finished but binary not found on PATH")
+            log(f"  ! {tid} install finished but binary not found on PATH — "
+                f"re-open the app or start a new terminal")
+        # Wire Program Files\dotnet into session PATH when we installed it
+        env_path = []
+        if tid == "dotnet" and WIN:
+            pf_dotnet = os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"), "dotnet")
+            if os.path.isdir(pf_dotnet):
+                env_path = [pf_dotnet]
+        return {"tool": tid, "home": "", "env": {"vars": {}, "path": env_path}}
+
+    if spec["kind"] == "nuget":
+        # Install NuGet CLI (if needed) and always ensure nuget.org is registered.
+        from . import prereqs as _prereqs  # local import avoids circulars at load
+        host_os = _system()
+        marker = spec.get("marker", "nuget")
+        if not shutil.which(marker):
+            if host_os not in spec.get("packages", {}):
+                raise RuntimeError("NuGet install is Windows-only")
+            mgr, args = spec["packages"][host_os]
+            if not shutil.which(mgr):
+                raise RuntimeError(
+                    f"{mgr} not found. Install NuGet from "
+                    "https://www.nuget.org/downloads or: "
+                    "choco install nuget.commandline")
+            log(f"  running: {mgr} {' '.join(args)}")
+            rc = subprocess.call([mgr] + args)
+            if rc != 0:
+                raise RuntimeError(f"{mgr} install failed for nuget (exit {rc})")
+        else:
+            log(f"  ✓ nuget already on PATH ({shutil.which(marker)})")
+        nuget_exe = shutil.which(marker) or "nuget"
+        log("  ensuring nuget.org package source…")
+        if not _prereqs.ensure_nuget_org(nuget_exe, log=log):
+            raise RuntimeError(
+                "Could not register nuget.org. Run manually: "
+                "nuget sources Add -Name nuget.org "
+                "-Source https://api.nuget.org/v3/index.json")
+        log("  ✓ nuget ready (CLI + nuget.org)")
         return {"tool": tid, "home": "", "env": {"vars": {}, "path": []}}
 
     if spec["kind"] == "rust":

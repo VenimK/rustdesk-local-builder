@@ -314,11 +314,128 @@ def check_sccache():
     return _status(True, ver, p, note="Optional: speeds up Rust/C++ rebuilds significantly.")
 
 
+def nuget_has_org_source(nuget_exe=None):
+    """True if nuget.exe has nuget.org (or api.nuget.org) as a package source."""
+    exe = nuget_exe or _which("nuget")
+    if not exe:
+        return False
+    try:
+        out = subprocess.check_output(
+            [exe, "sources", "list"],
+            stderr=subprocess.STDOUT, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return False
+    low = out.lower()
+    return "nuget.org" in low or "api.nuget.org" in low
+
+
+def ensure_nuget_org(nuget_exe=None, log=None):
+    """Register nuget.org if missing. Safe to call repeatedly.
+
+    Chocolatey's nuget.exe often ships with an empty source list, which makes
+    every restore fail with 'Unable to find version …'.
+    """
+    log = log or (lambda _m: None)
+    exe = nuget_exe or _which("nuget")
+    if not exe:
+        log("  ! nuget not found — cannot configure package sources")
+        return False
+    try:
+        out = subprocess.check_output(
+            [exe, "sources", "list"],
+            stderr=subprocess.STDOUT, timeout=30,
+            encoding="utf-8", errors="replace",
+        )
+    except Exception as e:
+        log(f"  · could not list nuget sources: {e}")
+        return False
+    low = out.lower()
+    if "nuget.org" in low or "api.nuget.org" in low:
+        if "nuget.org" in low and "[disabled]" in low:
+            log("  · enabling nuget.org package source")
+            try:
+                subprocess.check_call(
+                    [exe, "sources", "Enable", "-Name", "nuget.org"],
+                    timeout=30)
+            except Exception as e:
+                log(f"  · enable nuget.org failed: {e}")
+                return False
+        return True
+    log("  · adding nuget.org package source")
+    try:
+        subprocess.check_call(
+            [exe, "sources", "Add",
+             "-Name", "nuget.org",
+             "-Source", "https://api.nuget.org/v3/index.json"],
+            timeout=30)
+        return True
+    except Exception as e:
+        log(f"  · add nuget.org failed: {e}")
+        return False
+
+
 def check_nuget():
+    """NuGet CLI — required to restore WiX packages for Windows MSI builds."""
+    if _system() != "Windows":
+        return _status(False, note="Windows only (MSI packaging).")
     p = _which("nuget")
     if not p:
         return _status(False, hint=_install_hint("nuget"))
-    return _status(True, _run_version(["nuget", "help"]) or "nuget", p)
+    ver = _run_version(["nuget", "help"]) or "nuget"
+    if not nuget_has_org_source(p):
+        # Auto-fix empty source lists so a re-scan flips green without a
+        # manual `nuget sources Add` (common after Chocolatey nuget install).
+        if ensure_nuget_org(p):
+            return _status(True, ver, p,
+                           note="nuget.org source registered (was missing).")
+        return _status(
+            False, ver, p,
+            note="nuget.org package source missing — WiX restore will fail.",
+            hint="Run: nuget sources Add -Name nuget.org "
+                 "-Source https://api.nuget.org/v3/index.json")
+    return _status(True, ver, p, note="Needed for MSI / WiX package restore.")
+
+
+def check_dotnet():
+    """ .NET SDK — required to resolve WixToolset.Sdk for MSI (WiX 4). """
+    if _system() != "Windows":
+        return _status(False, note="Windows only (MSI / WiX 4 packaging).")
+    p = _which("dotnet")
+    if not p:
+        # Common install location not yet on PATH for this process
+        for cand in (
+            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"),
+                         "dotnet", "dotnet.exe"),
+            r"C:\Program Files\dotnet\dotnet.exe",
+        ):
+            if os.path.isfile(cand):
+                p = cand
+                break
+    if not p:
+        return _status(False, hint=_install_hint("dotnet"))
+    # Prefer listing SDKs — runtime-only installs have no SDKs and cannot
+    # restore WixToolset.Sdk.
+    try:
+        out = subprocess.check_output(
+            [p, "--list-sdks"],
+            stderr=subprocess.STDOUT, timeout=20,
+            encoding="utf-8", errors="replace",
+        ).strip()
+    except Exception:
+        out = ""
+    if not out:
+        ver = _run_version([p, "--version"]) or "dotnet"
+        return _status(
+            False, ver, p,
+            note="dotnet found but no SDK installed (runtime only?). "
+                 "WiX 4 needs an SDK (e.g. .NET 8).",
+            hint=_install_hint("dotnet"))
+    # First line like: "8.0.423 [C:\Program Files\dotnet\sdk]"
+    first = out.splitlines()[0].strip()
+    return _status(True, first, p,
+                   note="Needed for WiX Toolset SDK 4.x (Windows MSI).")
 
 
 def check_imagemagick():
@@ -363,6 +480,7 @@ CHECKS = {
     "vcpkg": check_vcpkg,
     "msbuild": check_msbuild,
     "nuget": check_nuget,
+    "dotnet": check_dotnet,
     "java": check_java,
     "android_ndk": check_android_ndk,
     "xcode": check_xcode,
@@ -384,7 +502,8 @@ LABELS = {
     "llvm": "LLVM / libclang",
     "vcpkg": "vcpkg (native deps: ffmpeg, hwcodec)",
     "msbuild": "MSBuild (Visual Studio)",
-    "nuget": "NuGet (MSI packaging dependency)",
+    "nuget": "NuGet CLI (MSI / WiX packages)",
+    "dotnet": ".NET SDK (WiX Toolset / MSI)",
     "java": "Java (JDK 17)",
     "android_ndk": "Android NDK",
     "xcode": "Xcode command-line tools",
@@ -489,7 +608,16 @@ def _install_hint(tool):
             "macOS": "brew install potrace",
         },
         "nuget": {
-            "Windows": "Download from https://www.nuget.org/downloads  and add to PATH, or: choco install nuget.commandline",
+            "Windows": "choco install nuget.commandline   "
+                       "(then ensure nuget.org: nuget sources Add -Name nuget.org "
+                       "-Source https://api.nuget.org/v3/index.json)",
+            "Linux": "N/A — MSI is Windows-only.",
+            "macOS": "N/A — MSI is Windows-only.",
+        },
+        "dotnet": {
+            "Windows": "winget install Microsoft.DotNet.SDK.8   "
+                       "or: https://dotnet.microsoft.com/download/dotnet/8.0  "
+                       "(.NET 8+ SDK required for WiX Toolset 4 / MSI)",
             "Linux": "N/A — MSI is Windows-only.",
             "macOS": "N/A — MSI is Windows-only.",
         },
