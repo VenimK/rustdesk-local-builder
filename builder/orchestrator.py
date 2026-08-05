@@ -877,6 +877,90 @@ class Build:
                 f"MSI not found after build (expected {msi_src}). "
                 f"See msbuild output above.")
 
+    def _ensure_windows_short_src(self):
+        """Re-expose rustdesk-src via a short junction when paths exceed MAX_PATH.
+
+        Flutter's MSBuild step writes .tlog files under deep plugin dirs
+        (e.g. flutter_gpu_texture_renderer_plugin...). With a workspace under
+        C:\\Users\\...\\Downloads\\... those paths exceed the classic 260-char
+        limit and fail with MSB3491 — even when LongPathsEnabled is on, some
+        MSBuild tasks still choke. A junction at C:\\rdlb keeps the same files
+        but shortens every absolute path by ~50–70 chars.
+        """
+        if self.host["os"] != "Windows" or self.dry_run:
+            return
+        # Observed failing relative path (+ a little headroom for hash suffixes)
+        worst_rel = os.path.join(
+            "flutter", "build", "windows", "x64", "plugins",
+            "flutter_gpu_texture_renderer",
+            "flutter_gpu_texture_renderer_plugin.dir", "Release",
+            "flutter_.XXXXXXXX.tlog",
+            "flutter_gpu_texture_renderer_plugin.lastbuildstate",
+        )
+        projected = len(os.path.join(self.src_dir, worst_rel))
+        if projected < 250:
+            return
+
+        real = os.path.abspath(self.src_dir)
+        candidates = [r"C:\rdlb", r"C:\rdlb-src", r"C:\r"]
+        short = None
+        for cand in candidates:
+            try:
+                if os.path.isdir(cand):
+                    try:
+                        if os.path.samefile(cand, real):
+                            short = cand
+                            break
+                    except OSError:
+                        pass
+                    # Existing dir/junction pointing elsewhere — try to drop
+                    # it if it's a junction (rmdir removes the link only).
+                    try:
+                        os.rmdir(cand)
+                    except OSError:
+                        continue  # occupied; try next candidate
+                # Create directory junction (no admin required, same volume).
+                self.log(f"  · source path too long for MSBuild "
+                         f"(~{projected} chars projected; limit 260)")
+                self.log(f"  · creating junction {cand} -> {real}")
+                rc = subprocess.run(
+                    ["cmd", "/c", "mklink", "/J", cand, real],
+                    capture_output=True, text=True,
+                    encoding="utf-8", errors="replace",
+                )
+                if rc.returncode != 0:
+                    err = (rc.stderr or rc.stdout or "").strip()
+                    self.log(f"  ! mklink {cand} failed: {err}")
+                    continue
+                short = cand
+                break
+            except Exception as e:
+                self.log(f"  ! short-path candidate {cand} failed: {e}")
+                continue
+
+        if not short:
+            self.log("  ! could not create a short path junction. Options:")
+            self.log("      1) Move this project closer to C:\\ (e.g. C:\\rd)")
+            self.log("      2) Enable Win32 long paths (admin):")
+            self.log("         New-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet"
+                     "\\Control\\FileSystem' -Name LongPathsEnabled -Value 1 "
+                     "-PropertyType DWORD -Force")
+            return
+
+        if os.path.normcase(os.path.abspath(self.src_dir)) != os.path.normcase(short):
+            self.src_dir = short
+            self.log(f"  · build will use {short} to stay under MAX_PATH")
+
+        # Stale flutter/build/windows from a previous MAX_PATH failure leaves
+        # half-written .tlog dirs that can confuse the next MSBuild run.
+        flutter_win = os.path.join(self.src_dir, "flutter", "build", "windows")
+        if os.path.isdir(flutter_win) and not self.dry_run:
+            self.log("  · cleaning flutter/build/windows (MAX_PATH recovery)")
+            try:
+                _force_rmtree(flutter_win)
+            except Exception as e:
+                self.log(f"  ! could not clean flutter build dir: {e}")
+
     def build_windows(self):
         self.log("\n=== Build Windows x86_64 ===")
         # Always use the MSVC toolchain — the official CI pins
@@ -897,6 +981,8 @@ class Build:
 
             # LLVM was already set up before generate_bridge — just confirm.
             self._ensure_llvm()
+            # Must run before Flutter/MSBuild — deep plugin .tlog paths exceed 260.
+            self._ensure_windows_short_src()
 
         self.setup_vcpkg("x64-windows-static")
         self.customize_for("windows")
